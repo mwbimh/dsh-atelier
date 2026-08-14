@@ -156,6 +156,7 @@ fn run_desktop(
         let dsh_state_sender = tray_state_sender.clone();
         let surface_state_sender = surface_sender.clone();
         tokio::spawn(async move {
+            let mut initial_snapshot = true;
             loop {
                 let snapshot = state.borrow().clone();
                 let status = TrayStatus::from(&snapshot);
@@ -169,12 +170,12 @@ fn run_desktop(
                 if dsh_state_sender.send(TrayStateUpdate::Dsh(status)).is_err() {
                     return;
                 }
-                if surface_state_sender
-                    .send(surface_request_for_snapshot(&snapshot))
-                    .is_err()
+                if let Some(request) = surface_request_for_snapshot(&snapshot, initial_snapshot)
+                    && surface_state_sender.send(request).is_err()
                 {
                     return;
                 }
+                initial_snapshot = false;
                 if state.changed().await.is_err() {
                     return;
                 }
@@ -288,10 +289,27 @@ fn run_desktop(
     tray_result
 }
 
-fn surface_request_for_snapshot(snapshot: &ControllerSnapshot) -> SurfaceRequest {
-    match &snapshot.web_url {
-        Some(url) => SurfaceRequest::Navigate(url.clone()),
-        None => SurfaceRequest::Hide,
+fn surface_request_for_snapshot(
+    snapshot: &ControllerSnapshot,
+    initial_snapshot: bool,
+) -> Option<SurfaceRequest> {
+    use dsh_atelier::controller::ControllerPhase;
+
+    if initial_snapshot {
+        return None;
+    }
+
+    match snapshot.phase {
+        ControllerPhase::Running => snapshot
+            .web_url
+            .as_ref()
+            .map(|url| SurfaceRequest::Navigate(url.clone())),
+        ControllerPhase::Stopped | ControllerPhase::Failed | ControllerPhase::Shutdown => {
+            Some(SurfaceRequest::Hide)
+        }
+        ControllerPhase::Starting
+        | ControllerPhase::RestartBackoff
+        | ControllerPhase::ShuttingDown => None,
     }
 }
 
@@ -301,18 +319,69 @@ mod tests {
     use dsh_atelier::dsh::readiness::LoopbackUrl;
 
     #[test]
-    fn surface_follows_the_validated_controller_url_and_hides_without_one() {
+    fn surface_follows_the_validated_controller_url_and_hides_when_stopped() {
         let mut snapshot = ControllerSnapshot::default();
         assert_eq!(
-            surface_request_for_snapshot(&snapshot),
-            SurfaceRequest::Hide
+            surface_request_for_snapshot(&snapshot, false),
+            Some(SurfaceRequest::Hide)
         );
 
         let url = LoopbackUrl::parse("http://127.0.0.1:43127").expect("valid loopback URL");
+        snapshot.phase = dsh_atelier::controller::ControllerPhase::Running;
         snapshot.web_url = Some(url.clone());
         assert_eq!(
-            surface_request_for_snapshot(&snapshot),
-            SurfaceRequest::Navigate(url)
+            surface_request_for_snapshot(&snapshot, false),
+            Some(SurfaceRequest::Navigate(url))
+        );
+    }
+
+    #[test]
+    fn surface_remains_visible_while_dsh_is_in_a_transitional_phase() {
+        use dsh_atelier::controller::ControllerPhase;
+
+        for phase in [
+            ControllerPhase::Starting,
+            ControllerPhase::RestartBackoff,
+            ControllerPhase::ShuttingDown,
+        ] {
+            let snapshot = ControllerSnapshot {
+                phase,
+                ..ControllerSnapshot::default()
+            };
+
+            assert_eq!(surface_request_for_snapshot(&snapshot, false), None);
+        }
+    }
+
+    #[test]
+    fn surface_hides_after_terminal_non_running_states() {
+        use dsh_atelier::controller::ControllerPhase;
+
+        for phase in [
+            ControllerPhase::Stopped,
+            ControllerPhase::Failed,
+            ControllerPhase::Shutdown,
+        ] {
+            let snapshot = ControllerSnapshot {
+                phase,
+                ..ControllerSnapshot::default()
+            };
+
+            assert_eq!(
+                surface_request_for_snapshot(&snapshot, false),
+                Some(SurfaceRequest::Hide)
+            );
+        }
+    }
+
+    #[test]
+    fn initial_stopped_snapshot_does_not_race_the_startup_loading_request() {
+        let snapshot = ControllerSnapshot::default();
+
+        assert_eq!(surface_request_for_snapshot(&snapshot, true), None);
+        assert_eq!(
+            surface_request_for_snapshot(&snapshot, false),
+            Some(SurfaceRequest::Hide)
         );
     }
 }

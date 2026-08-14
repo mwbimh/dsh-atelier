@@ -171,6 +171,8 @@ pub trait ControllerServices: Send + 'static {
     /// Stops the complete DSH process tree. Calling this while stopped must be safe.
     async fn stop_dsh(&mut self) -> anyhow::Result<()>;
 
+    async fn show_surface_loading(&mut self) -> anyhow::Result<()>;
+
     async fn show_surface(&mut self, url: &LoopbackUrl) -> anyhow::Result<()>;
 
     async fn open_web(&mut self, url: &LoopbackUrl) -> anyhow::Result<()>;
@@ -415,6 +417,12 @@ impl<S: ControllerServices> ControllerActor<S> {
 
     async fn open(&mut self, target: PresentationTarget) -> Result<(), ControllerError> {
         if self.state.phase != ControllerPhase::Running {
+            if target == PresentationTarget::SurfaceDsh {
+                self.services
+                    .show_surface_loading()
+                    .await
+                    .map_err(|error| self.operation_error("show DSH Surface loading", error))?;
+            }
             self.reset_manual_restart();
             self.start(Some(target)).await
         } else {
@@ -561,6 +569,11 @@ mod tests {
 
         async fn stop_dsh(&mut self) -> anyhow::Result<()> {
             self.actions.lock().unwrap().push("stop".into());
+            Ok(())
+        }
+
+        async fn show_surface_loading(&mut self) -> anyhow::Result<()> {
+            self.actions.lock().unwrap().push("loading".into());
             Ok(())
         }
 
@@ -734,7 +747,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_surface_starts_dsh_before_showing_the_validated_url() {
+    async fn open_surface_shows_loading_before_starting_dsh_and_then_shows_the_validated_url() {
         let (controller, actions) = spawn_controller(RestartPolicy::default());
 
         let state = controller
@@ -745,7 +758,7 @@ mod tests {
         assert_eq!(state.phase, ControllerPhase::Running);
         assert_eq!(
             *actions.lock().unwrap(),
-            ["start", "surface http://127.0.0.1:43127/"]
+            ["loading", "start", "surface http://127.0.0.1:43127/"]
         );
         controller
             .command(ControllerCommand::Shutdown)
@@ -789,10 +802,31 @@ mod tests {
         assert_eq!(
             *actions.lock().unwrap(),
             [
+                "loading",
                 "start",
                 "surface http://127.0.0.1:43127/",
                 "open http://127.0.0.1:43127/"
             ]
+        );
+        controller
+            .command(ControllerCommand::Shutdown)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn opening_the_surface_while_running_does_not_return_to_loading() {
+        let (controller, actions) = spawn_controller(RestartPolicy::default());
+        controller.command(ControllerCommand::Start).await.unwrap();
+
+        controller
+            .command(ControllerCommand::OpenSurface)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *actions.lock().unwrap(),
+            ["start", "surface http://127.0.0.1:43127/"]
         );
         controller
             .command(ControllerCommand::Shutdown)
@@ -811,7 +845,7 @@ mod tests {
 
         assert_eq!(
             *actions.lock().unwrap(),
-            ["start", "surface http://127.0.0.1:43127/"]
+            ["loading", "start", "surface http://127.0.0.1:43127/"]
         );
         controller
             .command(ControllerCommand::Shutdown)

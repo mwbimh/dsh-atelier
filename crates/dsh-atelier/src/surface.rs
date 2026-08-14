@@ -109,6 +109,7 @@ pub enum NavigationDecision {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SurfaceRequest {
+    ShowLoading,
     Show(LoopbackUrl),
     Navigate(LoopbackUrl),
     Hide,
@@ -137,14 +138,13 @@ pub struct DshWebSurface {
     _toolbar_context: WebContext,
     _dsh_context: WebContext,
     window: Window,
-    allowed_origin: Rc<RefCell<AllowedOrigin>>,
-    current_url: LoopbackUrl,
+    allowed_origin: Rc<RefCell<Option<AllowedOrigin>>>,
+    current_url: Option<LoopbackUrl>,
 }
 
 impl DshWebSurface {
-    pub fn new(
+    pub fn new_loading(
         event_loop: &ActiveEventLoop,
-        url: LoopbackUrl,
         profile_dir: PathBuf,
         action_sink: Rc<dyn Fn(SurfaceAction)>,
     ) -> Result<Self> {
@@ -184,22 +184,26 @@ impl DshWebSurface {
             .build_as_child(&window)
             .context("failed to create the DSH Surface toolbar")?;
 
-        let allowed_origin = Rc::new(RefCell::new(AllowedOrigin::from_loopback(&url)));
+        let allowed_origin = Rc::new(RefCell::new(None));
         let navigation_origin = allowed_origin.clone();
         let navigation_sink = action_sink.clone();
         let new_window_origin = allowed_origin.clone();
         let new_window_sink = action_sink;
         let mut dsh_context = surface_web_context(profile_dir.join("webview"));
         let dsh_webview = WebViewBuilder::new_with_web_context(&mut dsh_context)
-            .with_url(url.as_str())
+            .with_html(loading_html())
             .with_incognito(cfg!(target_os = "macos"))
             .with_bounds(dsh_bounds)
             .with_navigation_handler(move |requested| {
-                allow_navigation(&navigation_origin.borrow(), &navigation_sink, &requested)
+                allow_navigation(
+                    navigation_origin.borrow().as_ref(),
+                    &navigation_sink,
+                    &requested,
+                )
             })
             .with_new_window_req_handler(move |requested, _| {
                 if let NavigationDecision::OpenExternal(url) =
-                    new_window_origin.borrow().decide(&requested)
+                    decide_surface_navigation(new_window_origin.borrow().as_ref(), &requested)
                 {
                     new_window_sink(SurfaceAction::OpenExternal(url));
                 }
@@ -215,9 +219,9 @@ impl DshWebSurface {
             _dsh_context: dsh_context,
             window,
             allowed_origin,
-            current_url: url.clone(),
+            current_url: None,
         };
-        surface.show(&url)?;
+        surface.show_loading()?;
         Ok(surface)
     }
 
@@ -227,9 +231,25 @@ impl DshWebSurface {
     }
 
     pub fn show(&mut self, url: &LoopbackUrl) -> Result<()> {
-        if &self.current_url != url {
+        if self.current_url.as_ref() != Some(url) {
             self.navigate(url)?;
         }
+        self.show_window()
+    }
+
+    pub fn show_loading(&mut self) -> Result<()> {
+        if self.current_url.is_some() {
+            let previous_origin = self.allowed_origin.replace(None);
+            if let Err(error) = self.dsh_webview.load_html(&loading_html()) {
+                self.allowed_origin.replace(previous_origin);
+                return Err(error).context("failed to show the DSH loading page");
+            }
+            self.current_url = None;
+        }
+        self.show_window()
+    }
+
+    fn show_window(&self) -> Result<()> {
         self.window.set_minimized(false);
         self.window.set_visible(true);
         self.window.focus_window();
@@ -240,12 +260,12 @@ impl DshWebSurface {
 
     pub fn navigate(&mut self, url: &LoopbackUrl) -> Result<()> {
         let next_origin = AllowedOrigin::from_loopback(url);
-        let previous_origin = self.allowed_origin.replace(next_origin);
+        let previous_origin = self.allowed_origin.replace(Some(next_origin));
         if let Err(error) = self.dsh_webview.load_url(url.as_str()) {
             self.allowed_origin.replace(previous_origin);
             return Err(error).context("failed to navigate the DSH WebView");
         }
-        self.current_url = url.clone();
+        self.current_url = Some(url.clone());
         Ok(())
     }
 
@@ -255,6 +275,7 @@ impl DshWebSurface {
 
     pub fn handle_request(&mut self, request: &SurfaceRequest) -> Result<()> {
         match request {
+            SurfaceRequest::ShowLoading => self.show_loading(),
             SurfaceRequest::Show(url) => self.show(url),
             SurfaceRequest::Navigate(url) => self.navigate(url),
             SurfaceRequest::Hide => {
@@ -367,17 +388,30 @@ fn is_loopback_host(host: Option<Host<&str>>) -> bool {
 }
 
 fn allow_navigation(
-    origin: &AllowedOrigin,
+    origin: Option<&AllowedOrigin>,
     action_sink: &Rc<dyn Fn(SurfaceAction)>,
     requested: &str,
 ) -> bool {
-    match origin.decide(requested) {
+    match decide_surface_navigation(origin, requested) {
         NavigationDecision::Allow => true,
         NavigationDecision::OpenExternal(url) => {
             action_sink(SurfaceAction::OpenExternal(url));
             false
         }
         NavigationDecision::Reject => false,
+    }
+}
+
+fn decide_surface_navigation(
+    origin: Option<&AllowedOrigin>,
+    requested: &str,
+) -> NavigationDecision {
+    match origin {
+        Some(origin) => origin.decide(requested),
+        None if requested == "about:blank" || requested.starts_with("data:text/html") => {
+            NavigationDecision::Allow
+        }
+        None => NavigationDecision::Reject,
     }
 }
 
@@ -409,6 +443,21 @@ fn webview_bounds(size: PhysicalSize<u32>, scale_factor: f64) -> (Rect, Rect) {
 fn toolbar_html() -> String {
     format!(
         "{TOOLBAR_HTML_PREFIX}{TOOLBAR_DRAG_STYLE}{TOOLBAR_HTML_STYLE_SUFFIX}{TOOLBAR_BRAND_ICON}{TOOLBAR_HTML_BRAND_SUFFIX}{TOOLBAR_ACTIONS}{TOOLBAR_HTML_SCRIPT_PREFIX}{TOOLBAR_DRAG_SCRIPT}{TOOLBAR_HTML_SUFFIX}"
+    )
+}
+
+fn loading_html() -> String {
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
+<style>
+*{{box-sizing:border-box}}html,body{{margin:0;width:100%;height:100%;overflow:hidden;background:#f7f8fa;color:#171717;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}}
+body{{display:grid;place-items:center}}.loading{{display:flex;flex-direction:column;align-items:center;text-align:center}}
+.mark{{width:58px;height:50px;color:#111;animation:pulse 1.8s ease-in-out infinite}}.mark svg{{display:block;width:100%;height:100%}}.mark path{{fill:currentColor}}
+h1{{margin:20px 0 7px;font-size:20px;line-height:1.25;font-weight:650;letter-spacing:.01em}}p{{margin:0;color:#6b7280;font-size:13px}}
+@keyframes pulse{{0%,100%{{opacity:.62;transform:scale(.98)}}50%{{opacity:1;transform:scale(1)}}}}
+</style></head><body><main class="loading" role="status" aria-live="polite"><div class="mark">{TOOLBAR_BRAND_ICON}</div><h1>DeepSeek Harness</h1><p>正在启动…</p></main></body></html>"#
     )
 }
 
@@ -533,6 +582,29 @@ mod tests {
     }
 
     #[test]
+    fn loading_surface_allows_only_its_internal_html_document() {
+        for requested in ["about:blank", "data:text/html,hello"] {
+            assert_eq!(
+                decide_surface_navigation(None, requested),
+                NavigationDecision::Allow
+            );
+        }
+        for requested in [
+            "http://127.0.0.1:43127/",
+            "https://example.com/",
+            "data:text/plain,hello",
+            "data:application/javascript,alert(1)",
+            "file:///etc/passwd",
+        ] {
+            assert_eq!(
+                decide_surface_navigation(None, requested),
+                NavigationDecision::Reject,
+                "unexpected loading-page decision for {requested}"
+            );
+        }
+    }
+
+    #[test]
     fn preserves_an_explicit_default_port_in_the_allowed_origin() {
         let origin = AllowedOrigin::from_loopback(
             &LoopbackUrl::parse("http://127.0.0.1:80").expect("trusted readiness URL"),
@@ -563,6 +635,20 @@ mod tests {
         assert!(html.contains("viewBox=\"0 0 27 23\""));
         assert!(html.contains("left:50%;transform:translateX(-50%)"));
         assert!(!html.contains(">DSH<"));
+        assert!(!html.contains("#4d8dff"));
+    }
+
+    #[test]
+    fn loading_page_is_local_centered_and_uses_the_monochrome_brand() {
+        let html = loading_html();
+
+        assert!(html.contains("DeepSeek Harness"));
+        assert!(html.contains("正在启动…"));
+        assert!(html.contains("viewBox=\"0 0 27 23\""));
+        assert!(html.contains("place-items:center"));
+        assert!(html.contains("default-src 'none'"));
+        assert!(!html.contains("src=\"http"));
+        assert!(!html.contains("href=\"http"));
         assert!(!html.contains("#4d8dff"));
     }
 

@@ -342,29 +342,52 @@ impl TrayApplication {
         }
     }
 
+    fn create_loading_surface(&self, event_loop: &ActiveEventLoop) -> Result<DshWebSurface> {
+        let proxy = self.event_proxy.clone();
+        let sink = Rc::new(move |action| {
+            let _ = proxy.send_event(TrayEvent::SurfaceAction(action));
+        });
+        DshWebSurface::new_loading(event_loop, self.surface_directory.clone(), sink)
+    }
+
+    fn report_surface_creation_error(&self, error: &anyhow::Error) {
+        tracing::error!(%error, "failed to create the DSH Surface");
+        let _ = self.notifier.notify(
+            "DSH Surface unavailable",
+            "Atelier could not create the DSH window. DSH is still running from the Tray.",
+        );
+    }
+
     fn handle_surface_request(&mut self, event_loop: &ActiveEventLoop, request: SurfaceRequest) {
         match request {
-            SurfaceRequest::Show(url) => {
+            SurfaceRequest::ShowLoading => {
                 if let Some(surface) = self.surface.as_mut() {
-                    if let Err(error) = surface.show(&url) {
-                        tracing::error!(%error, "failed to show the DSH Surface");
+                    if let Err(error) = surface.show_loading() {
+                        tracing::error!(%error, "failed to show the DSH loading page");
                     }
                     return;
                 }
 
-                let proxy = self.event_proxy.clone();
-                let sink = Rc::new(move |action| {
-                    let _ = proxy.send_event(TrayEvent::SurfaceAction(action));
-                });
-                match DshWebSurface::new(event_loop, url, self.surface_directory.clone(), sink) {
+                match self.create_loading_surface(event_loop) {
                     Ok(surface) => self.surface = Some(surface),
-                    Err(error) => {
-                        tracing::error!(%error, "failed to create the DSH Surface");
-                        let _ = self.notifier.notify(
-                            "DSH Surface unavailable",
-                            "Atelier could not create the DSH window. DSH is still running from the Tray.",
-                        );
+                    Err(error) => self.report_surface_creation_error(&error),
+                }
+            }
+            SurfaceRequest::Show(url) => {
+                if self.surface.is_none() {
+                    match self.create_loading_surface(event_loop) {
+                        Ok(surface) => self.surface = Some(surface),
+                        Err(error) => {
+                            self.report_surface_creation_error(&error);
+                            return;
+                        }
                     }
+                }
+
+                if let Some(surface) = self.surface.as_mut()
+                    && let Err(error) = surface.show(&url)
+                {
+                    tracing::error!(%error, "failed to show the DSH Surface");
                 }
             }
             SurfaceRequest::Navigate(url) => {

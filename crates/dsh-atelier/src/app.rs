@@ -199,6 +199,14 @@ impl ControllerServices for RuntimeServices {
         Ok(())
     }
 
+    async fn show_surface_loading(&mut self) -> Result<()> {
+        self.surface_sender
+            .as_ref()
+            .context("the DSH Surface host is unavailable")?
+            .send(SurfaceRequest::ShowLoading)
+            .context("send the loading request to the DSH Surface host")
+    }
+
     async fn show_surface(&mut self, url: &LoopbackUrl) -> Result<()> {
         self.surface_sender
             .as_ref()
