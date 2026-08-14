@@ -1,9 +1,11 @@
 use thiserror::Error;
 
 use crate::dsh::readiness::LoopbackUrl;
+use crate::surface::ExternalUrl;
 
 pub trait Browser: Send + Sync {
     fn open(&self, url: &LoopbackUrl) -> Result<(), PlatformError>;
+    fn open_external(&self, url: &ExternalUrl) -> Result<(), PlatformError>;
 }
 
 pub trait Notifier: Send + Sync {

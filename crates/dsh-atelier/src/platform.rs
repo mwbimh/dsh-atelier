@@ -98,6 +98,7 @@ mod windows {
     use crate::{
         dsh::readiness::LoopbackUrl,
         ports::{Autostart, Browser, Notifier},
+        surface::ExternalUrl,
     };
 
     const SHORTCUT_NAME: &str = "DSH Atelier.lnk";
@@ -108,28 +109,36 @@ mod windows {
 
     impl Browser for WindowsBrowser {
         fn open(&self, url: &LoopbackUrl) -> Result<(), PlatformError> {
-            let url = HSTRING::from(url.as_str());
-            // SAFETY: all pointers are borrowed from live HSTRING values for the
-            // duration of this synchronous call. The URL can only be constructed
-            // as an exact DSH loopback readiness URL.
-            let result = unsafe {
-                ShellExecuteW(
-                    None,
-                    windows::core::w!("open"),
-                    PCWSTR(url.as_ptr()),
-                    None,
-                    None,
-                    SW_SHOWNORMAL,
-                )
-            };
-            let code = result.0 as isize;
-            if code > 32 {
-                Ok(())
-            } else {
-                Err(PlatformError::new(format!(
-                    "failed to open the default browser (ShellExecuteW returned {code})"
-                )))
-            }
+            open_in_default_browser(url.as_str())
+        }
+
+        fn open_external(&self, url: &ExternalUrl) -> Result<(), PlatformError> {
+            open_in_default_browser(url.as_str())
+        }
+    }
+
+    fn open_in_default_browser(value: &str) -> Result<(), PlatformError> {
+        let url = HSTRING::from(value);
+        // SAFETY: all pointers are borrowed from live HSTRING values for the
+        // duration of this synchronous call. Callers only pass URL wrappers
+        // that validate either the managed DSH origin or an external HTTP(S) URL.
+        let result = unsafe {
+            ShellExecuteW(
+                None,
+                windows::core::w!("open"),
+                PCWSTR(url.as_ptr()),
+                None,
+                None,
+                SW_SHOWNORMAL,
+            )
+        };
+        let code = result.0 as isize;
+        if code > 32 {
+            Ok(())
+        } else {
+            Err(PlatformError::new(format!(
+                "failed to open the default browser (ShellExecuteW returned {code})"
+            )))
         }
     }
 
@@ -411,6 +420,7 @@ mod macos {
     use crate::{
         dsh::readiness::LoopbackUrl,
         ports::{Autostart, Browser, Notifier},
+        surface::ExternalUrl,
     };
 
     const LAUNCH_AGENT_NAME: &str = "com.dsh-atelier.plist";
@@ -420,11 +430,19 @@ mod macos {
 
     impl Browser for MacBrowser {
         fn open(&self, url: &LoopbackUrl) -> Result<(), PlatformError> {
-            run_command(
-                Command::new("/usr/bin/open").arg(url.as_str()),
-                "open the default browser",
-            )
+            open_in_default_browser(url.as_str())
         }
+
+        fn open_external(&self, url: &ExternalUrl) -> Result<(), PlatformError> {
+            open_in_default_browser(url.as_str())
+        }
+    }
+
+    fn open_in_default_browser(value: &str) -> Result<(), PlatformError> {
+        run_command(
+            Command::new("/usr/bin/open").arg(value),
+            "open the default browser",
+        )
     }
 
     #[derive(Clone, Copy, Debug, Default)]

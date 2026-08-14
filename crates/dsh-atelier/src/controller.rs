@@ -21,24 +21,34 @@ pub enum LaunchKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PresentationTarget {
+    SurfaceDsh,
+    Web,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StartupDecision {
     pub start_dsh: bool,
-    pub open_web_when_ready: bool,
+    pub presentation: Option<PresentationTarget>,
 }
 
 #[must_use]
 pub fn startup_decision(config: &Config, launch_kind: LaunchKind) -> StartupDecision {
     match launch_kind {
         LaunchKind::Explicit => {
-            let open_web_when_ready = config.dsh.first_launch == FirstLaunch::Web;
+            let presentation = match config.dsh.first_launch {
+                FirstLaunch::SurfaceDsh => Some(PresentationTarget::SurfaceDsh),
+                FirstLaunch::Web => Some(PresentationTarget::Web),
+                FirstLaunch::None => None,
+            };
             StartupDecision {
-                start_dsh: config.dsh.auto_start || open_web_when_ready,
-                open_web_when_ready,
+                start_dsh: config.dsh.auto_start || presentation.is_some(),
+                presentation,
             }
         }
         LaunchKind::Login => StartupDecision {
             start_dsh: config.dsh.auto_start,
-            open_web_when_ready: false,
+            presentation: None,
         },
     }
 }
@@ -114,7 +124,8 @@ impl RestartTracker {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControllerCommand {
     Start,
-    Open,
+    OpenSurface,
+    OpenBrowser,
     Stop,
     Restart,
     Shutdown,
@@ -160,6 +171,8 @@ pub trait ControllerServices: Send + 'static {
     /// Stops the complete DSH process tree. Calling this while stopped must be safe.
     async fn stop_dsh(&mut self) -> anyhow::Result<()>;
 
+    async fn show_surface(&mut self, url: &LoopbackUrl) -> anyhow::Result<()>;
+
     async fn open_web(&mut self, url: &LoopbackUrl) -> anyhow::Result<()>;
 
     async fn notify(&mut self, title: &str, message: &str) -> anyhow::Result<()>;
@@ -178,12 +191,13 @@ impl ControllerHandle {
         launch_kind: LaunchKind,
     ) -> Result<ControllerSnapshot, ControllerError> {
         let decision = startup_decision(config, launch_kind);
-        if decision.open_web_when_ready {
-            self.command(ControllerCommand::Open).await
-        } else if decision.start_dsh {
-            self.command(ControllerCommand::Start).await
-        } else {
-            Ok(self.snapshot())
+        match decision.presentation {
+            Some(PresentationTarget::SurfaceDsh) => {
+                self.command(ControllerCommand::OpenSurface).await
+            }
+            Some(PresentationTarget::Web) => self.command(ControllerCommand::OpenBrowser).await,
+            None if decision.start_dsh => self.command(ControllerCommand::Start).await,
+            None => Ok(self.snapshot()),
         }
     }
 
@@ -306,7 +320,7 @@ impl<S: ControllerServices> ControllerActor<S> {
                 }
                 () = Self::wait_for_retry(&mut self.retry_sleep), if self.retry_sleep.is_some() => {
                     self.retry_sleep = None;
-                    if let Err(error) = self.start(false).await {
+                    if let Err(error) = self.start(None).await {
                         self.schedule_restart(Duration::ZERO, error.to_string()).await;
                     }
                 }
@@ -346,9 +360,10 @@ impl<S: ControllerServices> ControllerActor<S> {
         let result = match command {
             ControllerCommand::Start => {
                 self.reset_manual_restart();
-                self.start(false).await
+                self.start(None).await
             }
-            ControllerCommand::Open => self.open().await,
+            ControllerCommand::OpenSurface => self.open(PresentationTarget::SurfaceDsh).await,
+            ControllerCommand::OpenBrowser => self.open(PresentationTarget::Web).await,
             ControllerCommand::Stop => self.stop().await,
             ControllerCommand::Restart => self.restart().await,
             ControllerCommand::Shutdown => {
@@ -359,10 +374,13 @@ impl<S: ControllerServices> ControllerActor<S> {
         (result.map(|()| self.state.clone()), false)
     }
 
-    async fn start(&mut self, open_when_ready: bool) -> Result<(), ControllerError> {
+    async fn start(
+        &mut self,
+        presentation: Option<PresentationTarget>,
+    ) -> Result<(), ControllerError> {
         if self.state.phase == ControllerPhase::Running {
-            if open_when_ready {
-                return self.open_running().await;
+            if let Some(target) = presentation {
+                return self.present_running(target).await;
             }
             return Ok(());
         }
@@ -380,8 +398,8 @@ impl<S: ControllerServices> ControllerActor<S> {
                 self.state.web_url = Some(url);
                 self.state.restart_attempts = self.restart_tracker.attempts();
                 self.publish();
-                if open_when_ready {
-                    self.open_running().await?;
+                if let Some(target) = presentation {
+                    self.present_running(target).await?;
                 }
                 Ok(())
             }
@@ -395,26 +413,34 @@ impl<S: ControllerServices> ControllerActor<S> {
         }
     }
 
-    async fn open(&mut self) -> Result<(), ControllerError> {
+    async fn open(&mut self, target: PresentationTarget) -> Result<(), ControllerError> {
         if self.state.phase != ControllerPhase::Running {
             self.reset_manual_restart();
-            self.start(true).await
+            self.start(Some(target)).await
         } else {
-            self.open_running().await
+            self.present_running(target).await
         }
     }
 
-    async fn open_running(&mut self) -> Result<(), ControllerError> {
+    async fn present_running(&mut self, target: PresentationTarget) -> Result<(), ControllerError> {
         let url = self
             .state
             .web_url
             .as_ref()
             .expect("a running controller must retain its validated URL")
             .clone();
-        self.services
-            .open_web(&url)
-            .await
-            .map_err(|error| self.operation_error("open DSH Web UI", error))
+        match target {
+            PresentationTarget::SurfaceDsh => self
+                .services
+                .show_surface(&url)
+                .await
+                .map_err(|error| self.operation_error("show DSH Surface", error)),
+            PresentationTarget::Web => self
+                .services
+                .open_web(&url)
+                .await
+                .map_err(|error| self.operation_error("open DSH Web UI", error)),
+        }
     }
 
     async fn stop(&mut self) -> Result<(), ControllerError> {
@@ -437,7 +463,7 @@ impl<S: ControllerServices> ControllerActor<S> {
 
     async fn restart(&mut self) -> Result<(), ControllerError> {
         self.stop().await?;
-        self.start(false).await
+        self.start(None).await
     }
 
     async fn stop_for_shutdown(&mut self) {
@@ -517,7 +543,7 @@ mod tests {
 
     use super::{
         Controller, ControllerCommand, ControllerPhase, ControllerServices, LaunchKind,
-        RestartDecision, RestartPolicy, RestartTracker, startup_decision,
+        PresentationTarget, RestartDecision, RestartPolicy, RestartTracker, startup_decision,
     };
 
     struct FakeServices {
@@ -535,6 +561,17 @@ mod tests {
 
         async fn stop_dsh(&mut self) -> anyhow::Result<()> {
             self.actions.lock().unwrap().push("stop".into());
+            Ok(())
+        }
+
+        async fn show_surface(
+            &mut self,
+            url: &crate::dsh::readiness::LoopbackUrl,
+        ) -> anyhow::Result<()> {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(format!("surface {}", url.as_str()));
             Ok(())
         }
 
@@ -569,30 +606,53 @@ mod tests {
     }
 
     #[test]
-    fn explicit_launch_starts_dsh_and_opens_the_configured_web_target() {
+    fn explicit_launch_starts_dsh_and_presents_the_configured_surface_target() {
         let decision = startup_decision(&Config::default(), LaunchKind::Explicit);
 
         assert!(decision.start_dsh);
-        assert!(decision.open_web_when_ready);
+        assert_eq!(decision.presentation, Some(PresentationTarget::SurfaceDsh));
     }
 
     #[test]
-    fn login_launch_never_opens_a_browser() {
+    fn login_launch_never_presents_a_target() {
         let decision = startup_decision(&Config::default(), LaunchKind::Login);
 
         assert!(decision.start_dsh);
-        assert!(!decision.open_web_when_ready);
+        assert_eq!(decision.presentation, None);
     }
 
     #[test]
-    fn an_explicit_web_target_starts_dsh_even_when_auto_start_is_disabled() {
+    fn login_launch_respects_disabled_auto_start() {
+        let mut config = Config::default();
+        config.dsh.auto_start = false;
+
+        let decision = startup_decision(&config, LaunchKind::Login);
+
+        assert!(!decision.start_dsh);
+        assert_eq!(decision.presentation, None);
+    }
+
+    #[test]
+    fn an_explicit_surface_target_starts_dsh_even_when_auto_start_is_disabled() {
         let mut config = Config::default();
         config.dsh.auto_start = false;
 
         let decision = startup_decision(&config, LaunchKind::Explicit);
 
         assert!(decision.start_dsh);
-        assert!(decision.open_web_when_ready);
+        assert_eq!(decision.presentation, Some(PresentationTarget::SurfaceDsh));
+    }
+
+    #[test]
+    fn an_explicit_web_target_starts_dsh_even_when_auto_start_is_disabled() {
+        let mut config = Config::default();
+        config.dsh.auto_start = false;
+        config.dsh.first_launch = FirstLaunch::Web;
+
+        let decision = startup_decision(&config, LaunchKind::Explicit);
+
+        assert!(decision.start_dsh);
+        assert_eq!(decision.presentation, Some(PresentationTarget::Web));
     }
 
     #[test]
@@ -604,7 +664,18 @@ mod tests {
         let decision = startup_decision(&config, LaunchKind::Explicit);
 
         assert!(!decision.start_dsh);
-        assert!(!decision.open_web_when_ready);
+        assert_eq!(decision.presentation, None);
+    }
+
+    #[test]
+    fn none_with_auto_start_starts_dsh_without_presenting_it() {
+        let mut config = Config::default();
+        config.dsh.first_launch = FirstLaunch::None;
+
+        let decision = startup_decision(&config, LaunchKind::Explicit);
+
+        assert!(decision.start_dsh);
+        assert_eq!(decision.presentation, None);
     }
 
     #[test]
@@ -663,16 +734,124 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_starts_dsh_before_opening_the_validated_url() {
+    async fn open_surface_starts_dsh_before_showing_the_validated_url() {
         let (controller, actions) = spawn_controller(RestartPolicy::default());
 
-        let state = controller.command(ControllerCommand::Open).await.unwrap();
+        let state = controller
+            .command(ControllerCommand::OpenSurface)
+            .await
+            .unwrap();
+
+        assert_eq!(state.phase, ControllerPhase::Running);
+        assert_eq!(
+            *actions.lock().unwrap(),
+            ["start", "surface http://127.0.0.1:43127/"]
+        );
+        controller
+            .command(ControllerCommand::Shutdown)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_browser_starts_dsh_before_opening_the_validated_url() {
+        let (controller, actions) = spawn_controller(RestartPolicy::default());
+
+        let state = controller
+            .command(ControllerCommand::OpenBrowser)
+            .await
+            .unwrap();
 
         assert_eq!(state.phase, ControllerPhase::Running);
         assert_eq!(
             *actions.lock().unwrap(),
             ["start", "open http://127.0.0.1:43127/"]
         );
+        controller
+            .command(ControllerCommand::Shutdown)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn opening_each_target_while_running_reuses_the_managed_dsh_process() {
+        let (controller, actions) = spawn_controller(RestartPolicy::default());
+        controller
+            .command(ControllerCommand::OpenSurface)
+            .await
+            .unwrap();
+
+        controller
+            .command(ControllerCommand::OpenBrowser)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *actions.lock().unwrap(),
+            [
+                "start",
+                "surface http://127.0.0.1:43127/",
+                "open http://127.0.0.1:43127/"
+            ]
+        );
+        controller
+            .command(ControllerCommand::Shutdown)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn apply_startup_routes_the_surface_target() {
+        let (controller, actions) = spawn_controller(RestartPolicy::default());
+
+        controller
+            .apply_startup(&Config::default(), LaunchKind::Explicit)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *actions.lock().unwrap(),
+            ["start", "surface http://127.0.0.1:43127/"]
+        );
+        controller
+            .command(ControllerCommand::Shutdown)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn apply_startup_routes_the_browser_target() {
+        let (controller, actions) = spawn_controller(RestartPolicy::default());
+        let mut config = Config::default();
+        config.dsh.first_launch = FirstLaunch::Web;
+
+        controller
+            .apply_startup(&config, LaunchKind::Explicit)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *actions.lock().unwrap(),
+            ["start", "open http://127.0.0.1:43127/"]
+        );
+        controller
+            .command(ControllerCommand::Shutdown)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn apply_startup_can_start_without_presenting_a_target() {
+        let (controller, actions) = spawn_controller(RestartPolicy::default());
+        let mut config = Config::default();
+        config.dsh.first_launch = FirstLaunch::None;
+
+        controller
+            .apply_startup(&config, LaunchKind::Explicit)
+            .await
+            .unwrap();
+
+        assert_eq!(*actions.lock().unwrap(), ["start"]);
         controller
             .command(ControllerCommand::Shutdown)
             .await

@@ -2,6 +2,7 @@ use std::{
     fs,
     io::Cursor,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::mpsc::{Receiver, Sender},
     thread,
 };
@@ -25,6 +26,10 @@ use winit::{
 use crate::{
     controller::{ControllerPhase, ControllerSnapshot},
     dsh::update::{DshUpdatePhase, DshUpdateSnapshot},
+    paths::AtelierPaths,
+    platform::{NativeBrowser, NativeNotifier},
+    ports::{Browser, Notifier},
+    surface::{DshWebSurface, SurfaceAction, SurfaceRequest},
 };
 
 const STATUS_ID: &str = "status";
@@ -137,6 +142,7 @@ fn fit_icon_to_square(source: &RgbaImage) -> RgbaImage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrayCommand {
     OpenDsh,
+    OpenDshInBrowser,
     Start,
     Stop,
     Restart,
@@ -194,18 +200,29 @@ pub enum TrayStateUpdate {
 enum TrayEvent {
     Menu(MenuId),
     State(TrayStateUpdate),
+    Surface(SurfaceRequest),
+    SurfaceAction(SurfaceAction),
 }
 
 pub fn run_tray(command_sender: Sender<TrayCommand>) -> Result<()> {
     let (_state_sender, state_receiver) = std::sync::mpsc::channel();
-    run_tray_with_ready(command_sender, state_receiver, bundled_tray_icon()?, || {
-        Ok(())
-    })
+    let (_surface_sender, surface_receiver) = std::sync::mpsc::channel();
+    let surface_directory = AtelierPaths::discover()?.dsh_surface_dir;
+    run_tray_with_ready(
+        command_sender,
+        state_receiver,
+        surface_receiver,
+        surface_directory,
+        bundled_tray_icon()?,
+        || Ok(()),
+    )
 }
 
 pub fn run_tray_with_ready(
     command_sender: Sender<TrayCommand>,
     state_receiver: Receiver<TrayStateUpdate>,
+    surface_receiver: Receiver<SurfaceRequest>,
+    surface_directory: PathBuf,
     icon: TrayIconAsset,
     on_ready: impl FnOnce() -> Result<()> + 'static,
 ) -> Result<()> {
@@ -232,7 +249,28 @@ pub fn run_tray_with_ready(
         })
         .context("failed to start the tray status bridge")?;
 
-    let mut application = TrayApplication::new(command_sender, icon, Box::new(on_ready));
+    let surface_proxy = event_loop.create_proxy();
+    thread::Builder::new()
+        .name("atelier-surface-requests".to_owned())
+        .spawn(move || {
+            while let Ok(request) = surface_receiver.recv() {
+                if surface_proxy
+                    .send_event(TrayEvent::Surface(request))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .context("failed to start the DSH Surface request bridge")?;
+
+    let mut application = TrayApplication::new(
+        command_sender,
+        icon,
+        surface_directory,
+        event_loop.create_proxy(),
+        Box::new(on_ready),
+    );
     event_loop
         .run_app(&mut application)
         .context("tray event loop failed")?;
@@ -257,6 +295,11 @@ struct TrayApplication {
     current_status: TrayStatus,
     current_update: DshUpdateSnapshot,
     icon: TrayIconAsset,
+    surface_directory: PathBuf,
+    surface: Option<DshWebSurface>,
+    event_proxy: EventLoopProxy<TrayEvent>,
+    browser: NativeBrowser,
+    notifier: NativeNotifier,
     on_ready: Option<Box<dyn FnOnce() -> Result<()>>>,
     startup_error: Option<anyhow::Error>,
 }
@@ -265,6 +308,8 @@ impl TrayApplication {
     fn new(
         command_sender: Sender<TrayCommand>,
         icon: TrayIconAsset,
+        surface_directory: PathBuf,
+        event_proxy: EventLoopProxy<TrayEvent>,
         on_ready: Box<dyn FnOnce() -> Result<()>>,
     ) -> Self {
         Self {
@@ -276,6 +321,11 @@ impl TrayApplication {
             current_status: TrayStatus::Unknown,
             current_update: DshUpdateSnapshot::default(),
             icon,
+            surface_directory,
+            surface: None,
+            event_proxy,
+            browser: NativeBrowser::default(),
+            notifier: NativeNotifier::default(),
             on_ready: Some(on_ready),
             startup_error: None,
         }
@@ -289,6 +339,66 @@ impl TrayApplication {
         let should_exit = command == TrayCommand::Exit;
         if self.command_sender.send(command).is_err() || should_exit {
             event_loop.exit();
+        }
+    }
+
+    fn handle_surface_request(&mut self, event_loop: &ActiveEventLoop, request: SurfaceRequest) {
+        match request {
+            SurfaceRequest::Show(url) => {
+                if let Some(surface) = self.surface.as_mut() {
+                    if let Err(error) = surface.show(&url) {
+                        tracing::error!(%error, "failed to show the DSH Surface");
+                    }
+                    return;
+                }
+
+                let proxy = self.event_proxy.clone();
+                let sink = Rc::new(move |action| {
+                    let _ = proxy.send_event(TrayEvent::SurfaceAction(action));
+                });
+                match DshWebSurface::new(event_loop, url, self.surface_directory.clone(), sink) {
+                    Ok(surface) => self.surface = Some(surface),
+                    Err(error) => {
+                        tracing::error!(%error, "failed to create the DSH Surface");
+                        let _ = self.notifier.notify(
+                            "DSH Surface unavailable",
+                            "Atelier could not create the DSH window. DSH is still running from the Tray.",
+                        );
+                    }
+                }
+            }
+            SurfaceRequest::Navigate(url) => {
+                if let Some(surface) = self.surface.as_mut()
+                    && let Err(error) = surface.navigate(&url)
+                {
+                    tracing::error!(%error, "failed to navigate the DSH Surface");
+                }
+            }
+            SurfaceRequest::Hide => {
+                if let Some(surface) = self.surface.as_mut() {
+                    surface.hide();
+                }
+            }
+        }
+    }
+
+    fn handle_surface_action(&mut self, action: SurfaceAction) {
+        match action {
+            SurfaceAction::OpenInBrowser => {
+                let _ = self.command_sender.send(TrayCommand::OpenDshInBrowser);
+            }
+            SurfaceAction::OpenExternal(url) => {
+                if let Err(error) = self.browser.open_external(&url) {
+                    tracing::error!(%error, "failed to open an external DSH link");
+                }
+            }
+            action => {
+                if let Some(surface) = self.surface.as_mut()
+                    && let Err(error) = surface.handle_action(action)
+                {
+                    tracing::error!(%error, "DSH Surface action failed");
+                }
+            }
         }
     }
 }
@@ -324,6 +434,8 @@ impl ApplicationHandler<TrayEvent> for TrayApplication {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: TrayEvent) {
         match event {
             TrayEvent::Menu(id) => self.handle_menu(&id, event_loop),
+            TrayEvent::Surface(request) => self.handle_surface_request(event_loop, request),
+            TrayEvent::SurfaceAction(action) => self.handle_surface_action(action),
             TrayEvent::State(state) => match state {
                 TrayStateUpdate::Dsh(status) => {
                     self.current_status = status;
@@ -352,9 +464,15 @@ impl ApplicationHandler<TrayEvent> for TrayApplication {
     fn window_event(
         &mut self,
         _event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
-        _event: WindowEvent,
+        window_id: WindowId,
+        event: WindowEvent,
     ) {
+        if let Some(surface) = self.surface.as_mut()
+            && surface.window_id() == window_id
+            && let Err(error) = surface.handle_window_event(&event)
+        {
+            tracing::error!(%error, "DSH Surface window event failed");
+        }
     }
 }
 

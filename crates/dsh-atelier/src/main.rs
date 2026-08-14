@@ -11,11 +11,12 @@ use anyhow::{Context, Result};
 use dsh_atelier::{
     app::RuntimeServices,
     config::Config,
-    controller::{Controller, ControllerCommand, RestartPolicy},
+    controller::{Controller, ControllerCommand, ControllerSnapshot, RestartPolicy},
     paths::AtelierPaths,
     platform::{NativeAutostart, portable_bootstrap_sibling},
     ports::Autostart,
     runtime::{InstanceLock, RuntimeArguments, write_bootstrap_health},
+    surface::SurfaceRequest,
     tray::{TrayCommand, TrayStateUpdate, TrayStatus, load_tray_icon, run_tray_with_ready},
 };
 use tokio::runtime::{Builder, Runtime};
@@ -130,8 +131,10 @@ fn run_desktop(
 ) -> Result<()> {
     let (tray_command_sender, tray_command_receiver) = mpsc::channel();
     let (tray_state_sender, tray_state_receiver) = mpsc::channel();
+    let (surface_sender, surface_receiver) = mpsc::channel();
     let tray_icon = load_tray_icon(&paths.root)?;
-    let services = RuntimeServices::new(paths);
+    let surface_directory = paths.dsh_surface_dir.clone();
+    let services = RuntimeServices::new(paths).with_surface_sender(surface_sender.clone());
     let updater = services.updater();
     let monitor = services.clone();
 
@@ -151,6 +154,7 @@ fn run_desktop(
 
         let mut state = controller.subscribe();
         let dsh_state_sender = tray_state_sender.clone();
+        let surface_state_sender = surface_sender.clone();
         tokio::spawn(async move {
             loop {
                 let snapshot = state.borrow().clone();
@@ -163,6 +167,12 @@ fn run_desktop(
                     "DSH state changed"
                 );
                 if dsh_state_sender.send(TrayStateUpdate::Dsh(status)).is_err() {
+                    return;
+                }
+                if surface_state_sender
+                    .send(surface_request_for_snapshot(&snapshot))
+                    .is_err()
+                {
                     return;
                 }
                 if state.changed().await.is_err() {
@@ -235,7 +245,8 @@ fn run_desktop(
                     TrayCommand::Exit => return,
                     command => {
                         let command = match command {
-                            TrayCommand::OpenDsh => ControllerCommand::Open,
+                            TrayCommand::OpenDsh => ControllerCommand::OpenSurface,
+                            TrayCommand::OpenDshInBrowser => ControllerCommand::OpenBrowser,
                             TrayCommand::Start => ControllerCommand::Start,
                             TrayCommand::Stop => ControllerCommand::Stop,
                             TrayCommand::Restart => ControllerCommand::Restart,
@@ -259,6 +270,8 @@ fn run_desktop(
     let tray_result = run_tray_with_ready(
         tray_command_sender,
         tray_state_receiver,
+        surface_receiver,
+        surface_directory,
         tray_icon,
         move || match health {
             Some(ref request) => write_bootstrap_health(request, env!("CARGO_PKG_VERSION"))
@@ -273,4 +286,33 @@ fn run_desktop(
     }
     shutdown_result.context("shut down DSH before exiting Atelier")?;
     tray_result
+}
+
+fn surface_request_for_snapshot(snapshot: &ControllerSnapshot) -> SurfaceRequest {
+    match &snapshot.web_url {
+        Some(url) => SurfaceRequest::Navigate(url.clone()),
+        None => SurfaceRequest::Hide,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dsh_atelier::dsh::readiness::LoopbackUrl;
+
+    #[test]
+    fn surface_follows_the_validated_controller_url_and_hides_without_one() {
+        let mut snapshot = ControllerSnapshot::default();
+        assert_eq!(
+            surface_request_for_snapshot(&snapshot),
+            SurfaceRequest::Hide
+        );
+
+        let url = LoopbackUrl::parse("http://127.0.0.1:43127").expect("valid loopback URL");
+        snapshot.web_url = Some(url.clone());
+        assert_eq!(
+            surface_request_for_snapshot(&snapshot),
+            SurfaceRequest::Navigate(url)
+        );
+    }
 }

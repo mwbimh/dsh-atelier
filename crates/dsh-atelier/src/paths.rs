@@ -17,6 +17,7 @@ pub struct AtelierPaths {
     pub tools_dir: PathBuf,
     pub npm_dir: PathBuf,
     pub dsh_installations_dir: PathBuf,
+    pub dsh_surface_dir: PathBuf,
 }
 
 impl AtelierPaths {
@@ -41,6 +42,7 @@ impl AtelierPaths {
             tools_dir: root.join("tools"),
             npm_dir: root.join("npm"),
             dsh_installations_dir: root.join("installations").join("dsh"),
+            dsh_surface_dir: root.join("surfaces").join("dsh"),
             config_dir,
             root,
         }
@@ -55,6 +57,7 @@ impl AtelierPaths {
             &self.tools_dir,
             &self.npm_dir,
             &self.dsh_installations_dir,
+            &self.dsh_surface_dir,
         ] {
             fs::create_dir_all(path)?;
         }
@@ -91,6 +94,7 @@ mod tests {
 
         assert_eq!(paths.root, Path::new("test-state"));
         assert_eq!(paths.state_dir, Path::new("test-state/state"));
+        assert_eq!(paths.dsh_surface_dir, Path::new("test-state/surfaces/dsh"));
         assert_eq!(
             paths.dsh_installations_dir,
             Path::new("test-state/installations/dsh")
@@ -112,6 +116,7 @@ mod tests {
             &paths.tools_dir,
             &paths.npm_dir,
             &paths.dsh_installations_dir,
+            &paths.dsh_surface_dir,
         ] {
             assert!(owned.is_dir(), "missing {}", owned.display());
         }

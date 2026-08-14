@@ -45,7 +45,7 @@ impl Default for DshConfig {
     fn default() -> Self {
         Self {
             auto_start: true,
-            first_launch: FirstLaunch::Web,
+            first_launch: FirstLaunch::SurfaceDsh,
             startup_timeout_seconds: 30,
             health_check_interval_seconds: 30,
             install: DshInstallConfig::default(),
@@ -54,10 +54,13 @@ impl Default for DshConfig {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
 pub enum FirstLaunch {
+    #[serde(rename = "none")]
     None,
+    #[serde(rename = "surface:dsh")]
     #[default]
+    SurfaceDsh,
+    #[serde(rename = "web")]
     Web,
 }
 
@@ -99,12 +102,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_to_starting_dsh_and_opening_the_web_ui() {
+    fn defaults_to_starting_dsh_and_presenting_the_built_in_surface() {
         let config = Config::default();
 
         assert!(config.dsh.auto_start);
-        assert_eq!(config.dsh.first_launch, FirstLaunch::Web);
+        assert_eq!(config.dsh.first_launch, FirstLaunch::SurfaceDsh);
         assert!(!config.atelier.launch_at_login);
+    }
+
+    #[test]
+    fn accepts_the_dsh_surface_as_the_first_launch_target() {
+        let config = Config::from_toml(
+            r#"
+                [dsh]
+                first_launch = "surface:dsh"
+            "#,
+        )
+        .expect("the built-in DSH surface is supported");
+
+        assert_eq!(config.dsh.first_launch, FirstLaunch::SurfaceDsh);
+    }
+
+    #[test]
+    fn serializes_the_dsh_surface_with_its_namespaced_identifier() {
+        let serialized = toml::to_string(&Config::default()).expect("configuration serializes");
+
+        assert!(serialized.contains("first_launch = \"surface:dsh\""));
+    }
+
+    #[test]
+    fn accepts_web_as_an_explicit_first_launch_target() {
+        let config = Config::from_toml(
+            r#"
+                [dsh]
+                first_launch = "web"
+            "#,
+        )
+        .expect("the system browser remains supported");
+
+        assert_eq!(config.dsh.first_launch, FirstLaunch::Web);
     }
 
     #[test]

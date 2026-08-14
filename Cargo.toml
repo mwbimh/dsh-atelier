@@ -29,6 +29,7 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
 tray-icon = "0.21.2"
 url = "2.5.4"
 winit = "0.30.12"
+wry = { version = "0.56.1", default-features = false, features = ["os-webview"] }
 zip = { version = "4.3.0", default-features = false, features = ["deflate"] }
 winresource = "0.1.23"
 

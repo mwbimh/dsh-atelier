@@ -10,6 +10,7 @@ pub mod ports;
 pub mod process;
 pub mod registry;
 pub mod runtime;
+pub mod surface;
 pub mod tray;
 #[cfg(windows)]
 pub mod windows_job;

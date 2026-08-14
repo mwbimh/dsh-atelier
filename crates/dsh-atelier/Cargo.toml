@@ -26,6 +26,7 @@ tracing-subscriber.workspace = true
 tray-icon.workspace = true
 url.workspace = true
 winit.workspace = true
+wry.workspace = true
 zip.workspace = true
 
 [target.'cfg(windows)'.dependencies]

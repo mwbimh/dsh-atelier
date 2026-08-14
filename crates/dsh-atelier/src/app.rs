@@ -1,7 +1,7 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, mpsc::Sender},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -36,6 +36,7 @@ use crate::{
     ports::{Browser, Notifier},
     process::CommandSpec,
     registry::{DSH_PACKAGE_NAME, REGISTRY_CONNECT_TIMEOUT, REGISTRY_REQUEST_TIMEOUT},
+    surface::SurfaceRequest,
 };
 
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -54,6 +55,7 @@ pub struct RuntimeServices {
     browser: NativeBrowser,
     notifier: NativeNotifier,
     updater: DshUpdateManager,
+    surface_sender: Option<Sender<SurfaceRequest>>,
 }
 
 impl RuntimeServices {
@@ -69,7 +71,14 @@ impl RuntimeServices {
             browser: NativeBrowser::default(),
             notifier,
             updater,
+            surface_sender: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_surface_sender(mut self, sender: Sender<SurfaceRequest>) -> Self {
+        self.surface_sender = Some(sender);
+        self
     }
 
     #[must_use]
@@ -188,6 +197,14 @@ impl ControllerServices for RuntimeServices {
                 .context("stop managed DSH")?;
         }
         Ok(())
+    }
+
+    async fn show_surface(&mut self, url: &LoopbackUrl) -> Result<()> {
+        self.surface_sender
+            .as_ref()
+            .context("the DSH Surface host is unavailable")?
+            .send(SurfaceRequest::Show(url.clone()))
+            .context("send the validated DSH URL to the Surface host")
     }
 
     async fn open_web(&mut self, url: &LoopbackUrl) -> Result<()> {
