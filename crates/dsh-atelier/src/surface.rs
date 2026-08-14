@@ -408,7 +408,7 @@ fn webview_bounds(size: PhysicalSize<u32>, scale_factor: f64) -> (Rect, Rect) {
 
 fn toolbar_html() -> String {
     format!(
-        "{TOOLBAR_HTML_PREFIX}{TOOLBAR_BRAND_ICON}{TOOLBAR_HTML_BRAND_SUFFIX}{TOOLBAR_ACTIONS}{TOOLBAR_HTML_SUFFIX}"
+        "{TOOLBAR_HTML_PREFIX}{TOOLBAR_DRAG_STYLE}{TOOLBAR_HTML_STYLE_SUFFIX}{TOOLBAR_BRAND_ICON}{TOOLBAR_HTML_BRAND_SUFFIX}{TOOLBAR_ACTIONS}{TOOLBAR_HTML_SCRIPT_PREFIX}{TOOLBAR_DRAG_SCRIPT}{TOOLBAR_HTML_SUFFIX}"
     )
 }
 
@@ -426,7 +426,15 @@ const TOOLBAR_HTML_PREFIX: &str = r#"<!doctype html>
 <style>
 *{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden;font:13px system-ui,sans-serif;color:#dce8ff;background:#101726}
 #bar{position:relative;height:100%;display:flex;align-items:center;border-bottom:1px solid #27344d;user-select:none}
-#drag{height:100%;flex:1;cursor:default}
+#drag{height:100%;flex:1;cursor:default;"#;
+
+#[cfg(windows)]
+const TOOLBAR_DRAG_STYLE: &str = "app-region:drag";
+
+#[cfg(not(windows))]
+const TOOLBAR_DRAG_STYLE: &str = "";
+
+const TOOLBAR_HTML_STYLE_SUFFIX: &str = r#"}
 #identity{position:absolute;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:9px;pointer-events:none;white-space:nowrap}
 #mark{width:18px;height:18px;display:flex;align-items:center;justify-content:center}#mark svg{width:18px;height:auto}#mark path{fill:currentColor}.name{font-weight:600}
 .actions{z-index:1;height:100%;display:flex}button{--button-bg:#101726;width:44px;height:100%;border:0;color:#c9d6ec;background:var(--button-bg);font:16px system-ui;cursor:default}
@@ -446,10 +454,27 @@ const TOOLBAR_ACTIONS: &str = r#"<button data-action="refresh" title="Refresh" a
 #[cfg(not(windows))]
 const TOOLBAR_ACTIONS: &str = r#"<button data-action="refresh" title="Refresh" aria-label="Refresh">&#x21bb;</button><button data-action="open-browser" title="Open in browser" aria-label="Open in browser">&#x2197;</button>"#;
 
-const TOOLBAR_HTML_SUFFIX: &str = r#"</div></div>
+const TOOLBAR_HTML_SCRIPT_PREFIX: &str = r#"</div></div>
 <script>
 const send=value=>window.ipc.postMessage(value);
-document.getElementById('drag').addEventListener('mousedown',event=>{if(event.button===0)send('start-drag')});
+"#;
+
+#[cfg(windows)]
+const TOOLBAR_DRAG_SCRIPT: &str = "";
+
+#[cfg(not(windows))]
+const TOOLBAR_DRAG_SCRIPT: &str = r#"
+const drag=document.getElementById('drag');
+const DRAG_THRESHOLD=4;
+let dragOrigin=null;
+drag.addEventListener('mousedown',event=>{if(event.button===0)dragOrigin={x:event.screenX,y:event.screenY}});
+drag.addEventListener('mousemove',event=>{if(!dragOrigin||(event.buttons&1)===0)return;const dx=event.screenX-dragOrigin.x;const dy=event.screenY-dragOrigin.y;if(Math.hypot(dx,dy)<DRAG_THRESHOLD)return;dragOrigin=null;send('start-drag')});
+drag.addEventListener('mouseup',()=>{dragOrigin=null});
+drag.addEventListener('mouseleave',event=>{if((event.buttons&1)===0)dragOrigin=null});
+drag.addEventListener('dblclick',event=>{if(event.button===0){dragOrigin=null;send('toggle-maximize')}});
+"#;
+
+const TOOLBAR_HTML_SUFFIX: &str = r#"
 document.querySelectorAll('[data-action]').forEach(button=>button.addEventListener('click',()=>send(button.dataset.action)));
 window.setMaximized=maximized=>{const button=document.getElementById('maximize-button');if(!button)return;button.classList.toggle('restore',maximized);const label=maximized?'Restore':'Maximize';button.title=label;button.setAttribute('aria-label',label)};
 </script></body></html>"#;
@@ -553,6 +578,16 @@ mod tests {
             "window.setMaximized?.(false);"
         );
         assert_eq!(maximize_state_script(true), "window.setMaximized?.(true);");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_header_uses_the_native_non_client_drag_region() {
+        let html = toolbar_html();
+
+        assert!(html.contains("app-region:drag"));
+        assert!(!html.contains("send('start-drag')"));
+        assert!(!html.contains("addEventListener('dblclick'"));
     }
 
     #[test]
