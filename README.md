@@ -37,6 +37,7 @@ first_launch = "surface:dsh" # 或 "web"、"none"
 
 [atelier]
 launch_at_login = false
+theme = "dark" # 也可使用 "light" 或 "system"；暂不提供设置界面
 ```
 
 `first_launch` 控制显式启动后的打开方式：

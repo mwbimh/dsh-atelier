@@ -20,10 +20,11 @@ use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
     event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy},
-    window::WindowId,
+    window::{Theme, WindowId},
 };
 
 use crate::{
+    config::ThemePreference,
     controller::{ControllerPhase, ControllerSnapshot},
     dsh::update::{DshUpdatePhase, DshUpdateSnapshot},
     paths::AtelierPaths,
@@ -213,6 +214,7 @@ pub fn run_tray(command_sender: Sender<TrayCommand>) -> Result<()> {
         state_receiver,
         surface_receiver,
         surface_directory,
+        ThemePreference::default(),
         bundled_tray_icon()?,
         || Ok(()),
     )
@@ -223,6 +225,7 @@ pub fn run_tray_with_ready(
     state_receiver: Receiver<TrayStateUpdate>,
     surface_receiver: Receiver<SurfaceRequest>,
     surface_directory: PathBuf,
+    theme_preference: ThemePreference,
     icon: TrayIconAsset,
     on_ready: impl FnOnce() -> Result<()> + 'static,
 ) -> Result<()> {
@@ -268,6 +271,7 @@ pub fn run_tray_with_ready(
         command_sender,
         icon,
         surface_directory,
+        theme_preference,
         event_loop.create_proxy(),
         Box::new(on_ready),
     );
@@ -296,6 +300,7 @@ struct TrayApplication {
     current_update: DshUpdateSnapshot,
     icon: TrayIconAsset,
     surface_directory: PathBuf,
+    theme_preference: ThemePreference,
     surface: Option<DshWebSurface>,
     event_proxy: EventLoopProxy<TrayEvent>,
     browser: NativeBrowser,
@@ -309,6 +314,7 @@ impl TrayApplication {
         command_sender: Sender<TrayCommand>,
         icon: TrayIconAsset,
         surface_directory: PathBuf,
+        theme_preference: ThemePreference,
         event_proxy: EventLoopProxy<TrayEvent>,
         on_ready: Box<dyn FnOnce() -> Result<()>>,
     ) -> Self {
@@ -322,6 +328,7 @@ impl TrayApplication {
             current_update: DshUpdateSnapshot::default(),
             icon,
             surface_directory,
+            theme_preference,
             surface: None,
             event_proxy,
             browser: NativeBrowser::default(),
@@ -347,7 +354,12 @@ impl TrayApplication {
         let sink = Rc::new(move |action| {
             let _ = proxy.send_event(TrayEvent::SurfaceAction(action));
         });
-        DshWebSurface::new_loading(event_loop, self.surface_directory.clone(), sink)
+        DshWebSurface::new_loading(
+            event_loop,
+            self.surface_directory.clone(),
+            window_theme_override(self.theme_preference),
+            sink,
+        )
     }
 
     fn report_surface_creation_error(&self, error: &anyhow::Error) {
@@ -492,10 +504,32 @@ impl ApplicationHandler<TrayEvent> for TrayApplication {
     ) {
         if let Some(surface) = self.surface.as_mut()
             && surface.window_id() == window_id
-            && let Err(error) = surface.handle_window_event(&event)
         {
-            tracing::error!(%error, "DSH Surface window event failed");
+            let result = match event {
+                WindowEvent::ThemeChanged(system_theme) => {
+                    match system_theme_update(self.theme_preference, system_theme) {
+                        Some(theme) => surface.set_theme(theme),
+                        None => Ok(()),
+                    }
+                }
+                event => surface.handle_window_event(&event),
+            };
+            if let Err(error) = result {
+                tracing::error!(%error, "DSH Surface window event failed");
+            }
         }
+    }
+}
+
+fn system_theme_update(preference: ThemePreference, system_theme: Theme) -> Option<Theme> {
+    (preference == ThemePreference::System).then_some(system_theme)
+}
+
+fn window_theme_override(preference: ThemePreference) -> Option<Theme> {
+    match preference {
+        ThemePreference::Light => Some(Theme::Light),
+        ThemePreference::Dark => Some(Theme::Dark),
+        ThemePreference::System => None,
     }
 }
 
@@ -605,7 +639,45 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::config::ThemePreference;
     use crate::controller::{ControllerPhase, ControllerSnapshot};
+
+    #[test]
+    fn fixed_theme_preferences_ignore_system_theme_changes() {
+        assert_eq!(
+            system_theme_update(ThemePreference::Light, winit::window::Theme::Dark),
+            None
+        );
+        assert_eq!(
+            system_theme_update(ThemePreference::Dark, winit::window::Theme::Light),
+            None
+        );
+    }
+
+    #[test]
+    fn theme_preferences_map_to_native_window_overrides() {
+        assert_eq!(
+            window_theme_override(ThemePreference::Light),
+            Some(winit::window::Theme::Light)
+        );
+        assert_eq!(
+            window_theme_override(ThemePreference::Dark),
+            Some(winit::window::Theme::Dark)
+        );
+        assert_eq!(window_theme_override(ThemePreference::System), None);
+    }
+
+    #[test]
+    fn system_theme_preference_follows_system_theme_changes() {
+        assert_eq!(
+            system_theme_update(ThemePreference::System, winit::window::Theme::Light),
+            Some(winit::window::Theme::Light)
+        );
+        assert_eq!(
+            system_theme_update(ThemePreference::System, winit::window::Theme::Dark),
+            Some(winit::window::Theme::Dark)
+        );
+    }
 
     #[test]
     fn maps_action_menu_ids_to_commands() {

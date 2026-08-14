@@ -134,6 +134,7 @@ fn run_desktop(
     let (surface_sender, surface_receiver) = mpsc::channel();
     let tray_icon = load_tray_icon(&paths.root)?;
     let surface_directory = paths.dsh_surface_dir.clone();
+    let theme_preference = config.atelier.theme;
     let services = RuntimeServices::new(paths).with_surface_sender(surface_sender.clone());
     let updater = services.updater();
     let monitor = services.clone();
@@ -273,6 +274,7 @@ fn run_desktop(
         tray_state_receiver,
         surface_receiver,
         surface_directory,
+        theme_preference,
         tray_icon,
         move || match health {
             Some(ref request) => write_bootstrap_health(request, env!("CARGO_PKG_VERSION"))

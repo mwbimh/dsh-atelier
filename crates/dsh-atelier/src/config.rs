@@ -87,6 +87,16 @@ impl Default for DshInstallConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct AtelierConfig {
     pub launch_at_login: bool,
+    pub theme: ThemePreference,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemePreference {
+    Light,
+    #[default]
+    Dark,
+    System,
 }
 
 #[derive(Debug, Error)]
@@ -108,6 +118,60 @@ mod tests {
         assert!(config.dsh.auto_start);
         assert_eq!(config.dsh.first_launch, FirstLaunch::SurfaceDsh);
         assert!(!config.atelier.launch_at_login);
+        assert_eq!(config.atelier.theme, ThemePreference::Dark);
+    }
+
+    #[test]
+    fn an_existing_atelier_section_without_theme_uses_dark() {
+        let config = Config::from_toml(
+            r#"
+                [atelier]
+                launch_at_login = true
+            "#,
+        )
+        .expect("older configuration remains valid");
+
+        assert!(config.atelier.launch_at_login);
+        assert_eq!(config.atelier.theme, ThemePreference::Dark);
+    }
+
+    #[test]
+    fn accepts_all_supported_atelier_themes() {
+        for (value, expected) in [
+            ("light", ThemePreference::Light),
+            ("dark", ThemePreference::Dark),
+            ("system", ThemePreference::System),
+        ] {
+            let config = Config::from_toml(&format!(
+                r#"
+                    [atelier]
+                    theme = "{value}"
+                "#
+            ))
+            .expect("supported theme parses");
+
+            assert_eq!(config.atelier.theme, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_an_unknown_atelier_theme() {
+        let error = Config::from_toml(
+            r#"
+                [atelier]
+                theme = "sepia"
+            "#,
+        )
+        .expect_err("unknown themes must not silently fall back");
+
+        assert!(error.to_string().contains("theme"));
+    }
+
+    #[test]
+    fn serializes_the_default_atelier_theme_as_dark() {
+        let serialized = toml::to_string(&Config::default()).expect("configuration serializes");
+
+        assert!(serialized.contains("theme = \"dark\""));
     }
 
     #[test]
