@@ -10,6 +10,7 @@ rust-version = "1.92"
 [workspace.dependencies]
 anyhow = "1.0.98"
 async-trait = "0.1.88"
+base64 = "0.22.1"
 directories = "6.0.0"
 fs2 = "0.4.3"
 image = { version = "0.25.8", default-features = false, features = ["ico", "png"] }

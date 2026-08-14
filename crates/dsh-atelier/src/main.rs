@@ -17,7 +17,10 @@ use dsh_atelier::{
     ports::Autostart,
     runtime::{InstanceLock, RuntimeArguments, write_bootstrap_health},
     surface::SurfaceRequest,
-    tray::{TrayCommand, TrayStateUpdate, TrayStatus, load_tray_icon, run_tray_with_ready},
+    tray::{
+        SurfaceHostConfig, TrayCommand, TrayStateUpdate, TrayStatus, load_tray_icon,
+        run_tray_with_ready,
+    },
 };
 use tokio::runtime::{Builder, Runtime};
 use tracing_subscriber::EnvFilter;
@@ -134,6 +137,8 @@ fn run_desktop(
     let (surface_sender, surface_receiver) = mpsc::channel();
     let tray_icon = load_tray_icon(&paths.root)?;
     let surface_directory = paths.dsh_surface_dir.clone();
+    let atelier_root = paths.root.clone();
+    let surface_config = config.atelier.surface.clone();
     let theme_preference = config.atelier.theme;
     let services = RuntimeServices::new(paths).with_surface_sender(surface_sender.clone());
     let updater = services.updater();
@@ -273,8 +278,12 @@ fn run_desktop(
         tray_command_sender,
         tray_state_receiver,
         surface_receiver,
-        surface_directory,
-        theme_preference,
+        SurfaceHostConfig::new(
+            surface_directory,
+            atelier_root,
+            surface_config,
+            theme_preference,
+        ),
         tray_icon,
         move || match health {
             Some(ref request) => write_bootstrap_health(request, env!("CARGO_PKG_VERSION"))

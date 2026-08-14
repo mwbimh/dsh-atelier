@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 directories.workspace = true
 fs2.workspace = true
 image.workspace = true
@@ -34,6 +35,7 @@ windows = { version = "0.62.2", features = [
     "Data_Xml_Dom",
     "UI_Notifications",
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_System_Console",
     "Win32_System_Com",

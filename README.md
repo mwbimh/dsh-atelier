@@ -38,7 +38,17 @@ first_launch = "surface:dsh" # 或 "web"、"none"
 [atelier]
 launch_at_login = false
 theme = "dark" # 也可使用 "light" 或 "system"；暂不提供设置界面
+
+[atelier.surface]
+title = "DeepSeek Harness"
+loading_title = "DeepSeek Harness"
+loading_starting_text = "正在启动…"
+loading_started_text = "已启动"
+# title_icon = "branding/title.png"
+# loading_icon = "branding/loading.png"
 ```
+
+`atelier.surface` 控制 Atelier 自己维护的 Surface 标题栏和 loading 页，不修改 DSH 页面。`title_icon` 与 `loading_icon` 省略时使用内置黑白 DeepSeek 图标；配置相对路径时以 `~/.atelier` 为根目录解析。标题栏图标、loading 图标可以分别配置。
 
 `first_launch` 控制显式启动后的打开方式：
 

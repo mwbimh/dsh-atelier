@@ -24,7 +24,7 @@ use winit::{
 };
 
 use crate::{
-    config::ThemePreference,
+    config::{SurfaceConfig, ThemePreference},
     controller::{ControllerPhase, ControllerSnapshot},
     dsh::update::{DshUpdatePhase, DshUpdateSnapshot},
     paths::AtelierPaths,
@@ -208,24 +208,52 @@ enum TrayEvent {
 pub fn run_tray(command_sender: Sender<TrayCommand>) -> Result<()> {
     let (_state_sender, state_receiver) = std::sync::mpsc::channel();
     let (_surface_sender, surface_receiver) = std::sync::mpsc::channel();
-    let surface_directory = AtelierPaths::discover()?.dsh_surface_dir;
+    let paths = AtelierPaths::discover()?;
     run_tray_with_ready(
         command_sender,
         state_receiver,
         surface_receiver,
-        surface_directory,
-        ThemePreference::default(),
+        SurfaceHostConfig::new(
+            paths.dsh_surface_dir,
+            paths.root,
+            SurfaceConfig::default(),
+            ThemePreference::default(),
+        ),
         bundled_tray_icon()?,
         || Ok(()),
     )
+}
+
+#[derive(Clone, Debug)]
+pub struct SurfaceHostConfig {
+    profile_directory: PathBuf,
+    atelier_root: PathBuf,
+    presentation: SurfaceConfig,
+    theme: ThemePreference,
+}
+
+impl SurfaceHostConfig {
+    #[must_use]
+    pub fn new(
+        profile_directory: PathBuf,
+        atelier_root: PathBuf,
+        presentation: SurfaceConfig,
+        theme: ThemePreference,
+    ) -> Self {
+        Self {
+            profile_directory,
+            atelier_root,
+            presentation,
+            theme,
+        }
+    }
 }
 
 pub fn run_tray_with_ready(
     command_sender: Sender<TrayCommand>,
     state_receiver: Receiver<TrayStateUpdate>,
     surface_receiver: Receiver<SurfaceRequest>,
-    surface_directory: PathBuf,
-    theme_preference: ThemePreference,
+    surface_host: SurfaceHostConfig,
     icon: TrayIconAsset,
     on_ready: impl FnOnce() -> Result<()> + 'static,
 ) -> Result<()> {
@@ -270,8 +298,7 @@ pub fn run_tray_with_ready(
     let mut application = TrayApplication::new(
         command_sender,
         icon,
-        surface_directory,
-        theme_preference,
+        surface_host,
         event_loop.create_proxy(),
         Box::new(on_ready),
     );
@@ -299,8 +326,7 @@ struct TrayApplication {
     current_status: TrayStatus,
     current_update: DshUpdateSnapshot,
     icon: TrayIconAsset,
-    surface_directory: PathBuf,
-    theme_preference: ThemePreference,
+    surface_host: SurfaceHostConfig,
     surface: Option<DshWebSurface>,
     event_proxy: EventLoopProxy<TrayEvent>,
     browser: NativeBrowser,
@@ -313,8 +339,7 @@ impl TrayApplication {
     fn new(
         command_sender: Sender<TrayCommand>,
         icon: TrayIconAsset,
-        surface_directory: PathBuf,
-        theme_preference: ThemePreference,
+        surface_host: SurfaceHostConfig,
         event_proxy: EventLoopProxy<TrayEvent>,
         on_ready: Box<dyn FnOnce() -> Result<()>>,
     ) -> Self {
@@ -327,8 +352,7 @@ impl TrayApplication {
             current_status: TrayStatus::Unknown,
             current_update: DshUpdateSnapshot::default(),
             icon,
-            surface_directory,
-            theme_preference,
+            surface_host,
             surface: None,
             event_proxy,
             browser: NativeBrowser::default(),
@@ -356,8 +380,10 @@ impl TrayApplication {
         });
         DshWebSurface::new_loading(
             event_loop,
-            self.surface_directory.clone(),
-            window_theme_override(self.theme_preference),
+            self.surface_host.profile_directory.clone(),
+            &self.surface_host.atelier_root,
+            &self.surface_host.presentation,
+            window_theme_override(self.surface_host.theme),
             sink,
         )
     }
@@ -507,7 +533,7 @@ impl ApplicationHandler<TrayEvent> for TrayApplication {
         {
             let result = match event {
                 WindowEvent::ThemeChanged(system_theme) => {
-                    match system_theme_update(self.theme_preference, system_theme) {
+                    match system_theme_update(self.surface_host.theme, system_theme) {
                         Some(theme) => surface.set_theme(theme),
                         None => Ok(()),
                     }
