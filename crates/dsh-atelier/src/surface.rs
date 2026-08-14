@@ -211,11 +211,11 @@ fn theme_tokens(theme: Theme) -> ThemeTokens {
             button_hover: "#e8ebf0",
         },
         Theme::Dark => ThemeTokens {
-            canvas: "#101726",
-            text: "#dce8ff",
-            muted: "#94a3b8",
-            border: "#27344d",
-            button_hover: "#25314a",
+            canvas: "#0f0f0f",
+            text: "#f5f5f5",
+            muted: "#a2a4a6",
+            border: "#3c3c3d",
+            button_hover: "#292929",
         },
     }
 }
@@ -228,7 +228,7 @@ fn resolve_theme(theme: Option<Theme>) -> Theme {
 fn native_window_rgb(theme: Theme) -> (u8, u8, u8) {
     match theme {
         Theme::Light => (0xf7, 0xf8, 0xfa),
-        Theme::Dark => (0x10, 0x17, 0x26),
+        Theme::Dark => (0x0f, 0x0f, 0x0f),
     }
 }
 
@@ -1427,7 +1427,7 @@ mod tests {
     #[test]
     fn windows_native_background_matches_the_surface_canvas() {
         assert_eq!(native_window_rgb(Theme::Light), (0xf7, 0xf8, 0xfa));
-        assert_eq!(native_window_rgb(Theme::Dark), (0x10, 0x17, 0x26));
+        assert_eq!(native_window_rgb(Theme::Dark), (0x0f, 0x0f, 0x0f));
     }
 
     #[test]
@@ -1437,8 +1437,11 @@ mod tests {
 
         assert_eq!(light.canvas, "#f7f8fa");
         assert_eq!(light.text, "#171717");
-        assert_eq!(dark.canvas, "#101726");
-        assert_eq!(dark.text, "#dce8ff");
+        assert_eq!(dark.canvas, "#0f0f0f");
+        assert_eq!(dark.text, "#f5f5f5");
+        assert_eq!(dark.muted, "#a2a4a6");
+        assert_eq!(dark.border, "#3c3c3d");
+        assert_eq!(dark.button_hover, "#292929");
         assert_ne!(light.border, dark.border);
         assert_ne!(light.muted, dark.muted);
         assert_ne!(light.button_hover, dark.button_hover);
