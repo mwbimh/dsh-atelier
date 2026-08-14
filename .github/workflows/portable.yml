@@ -1,0 +1,75 @@
+name: Portable builds
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows x64 portable
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.92.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p atelier-bootstrap -p dsh-atelier
+      - name: Assemble archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/DSH-Atelier | Out-Null
+          New-Item -ItemType Directory -Force -Path dist/DSH-Atelier/icons | Out-Null
+          Copy-Item target/release/dsh-atelier.exe dist/DSH-Atelier/
+          Copy-Item target/release/dsh-atelier-runtime.exe dist/DSH-Atelier/
+          Copy-Item README.md,LICENSE dist/DSH-Atelier/
+          Copy-Item assets/icons/deepseek-blue.ico,assets/icons/deepseek-black.ico,assets/icons/deepseek-black.svg dist/DSH-Atelier/icons/
+          Compress-Archive -Path dist/DSH-Atelier -DestinationPath dist/dsh-atelier-windows-x64.zip
+          (Get-FileHash dist/dsh-atelier-windows-x64.zip -Algorithm SHA256).Hash.ToLower() |
+            Set-Content dist/dsh-atelier-windows-x64.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-atelier-windows-x64
+          path: dist/dsh-atelier-windows-x64.zip*
+          if-no-files-found: error
+
+  macos:
+    name: macOS universal portable
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.92.0
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build both architectures
+        run: |
+          cargo build --release --locked --target x86_64-apple-darwin -p atelier-bootstrap -p dsh-atelier
+          cargo build --release --locked --target aarch64-apple-darwin -p atelier-bootstrap -p dsh-atelier
+      - name: Assemble unsigned app bundle
+        run: |
+          mkdir -p "dist/DSH Atelier.app/Contents/MacOS"
+          lipo -create \
+            target/x86_64-apple-darwin/release/dsh-atelier \
+            target/aarch64-apple-darwin/release/dsh-atelier \
+            -output "dist/DSH Atelier.app/Contents/MacOS/DSH Atelier"
+          lipo -create \
+            target/x86_64-apple-darwin/release/dsh-atelier-runtime \
+            target/aarch64-apple-darwin/release/dsh-atelier-runtime \
+            -output "dist/DSH Atelier.app/Contents/MacOS/dsh-atelier-runtime"
+          cp packaging/macos/Info.plist "dist/DSH Atelier.app/Contents/Info.plist"
+          mkdir -p "dist/DSH Atelier.app/Contents/Resources/icons"
+          cp assets/icons/deepseek-blue.ico assets/icons/deepseek-black.ico assets/icons/deepseek-black.svg "dist/DSH Atelier.app/Contents/Resources/icons/"
+          ditto -c -k --keepParent "dist/DSH Atelier.app" dist/dsh-atelier-macos-universal.zip
+          shasum -a 256 dist/dsh-atelier-macos-universal.zip | awk '{print $1}' > dist/dsh-atelier-macos-universal.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-atelier-macos-universal
+          path: dist/dsh-atelier-macos-universal.zip*
+          if-no-files-found: error
