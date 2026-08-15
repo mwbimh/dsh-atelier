@@ -628,7 +628,7 @@ fn failed_atomic_pointer_replace_preserves_the_old_pointer_and_cleans_the_tempor
     persist_runtime_state(root.path(), &old_state).unwrap();
     let active_path = root.path().join("active.json");
     let old_bytes = fs::read(&active_path).unwrap();
-    let _held = fs::OpenOptions::new()
+    let held = fs::OpenOptions::new()
         .read(true)
         .share_mode(0)
         .open(&active_path)
@@ -639,6 +639,7 @@ fn failed_atomic_pointer_replace_preserves_the_old_pointer_and_cleans_the_tempor
     };
 
     assert!(persist_runtime_state(root.path(), &next_state).is_err());
+    drop(held);
     assert_eq!(fs::read(&active_path).unwrap(), old_bytes);
     let temporary_files = fs::read_dir(root.path())
         .unwrap()
