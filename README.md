@@ -1,6 +1,6 @@
 # DSH Atelier
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) ![LD badge](https://ld.xh.do/ld-badge.svg)
+<a><img src="https://img.shields.io/badge/License-MIT-yellow.svg"></a> <img src="https://img.shields.io/badge/DeepSeek-4D6BFE?logo=deepseek&amp;logoColor=white"> <img src="https://shorturl.at/ggSqS">
 
 DSH Atelier is a cross-platform desktop launcher for [Deepseek Harness](https://github.com/deepseek-ai/deepseek-harness).
 
