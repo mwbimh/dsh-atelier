@@ -446,7 +446,7 @@ jobs:
           ARTIFACT_NAME: release-candidate-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
           GH_TOKEN: ${{ github.token }}
           HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           workflow_id=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml" --jq '.id')
@@ -460,12 +460,12 @@ jobs:
             if gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" | jq -e \
               --argjson workflow_id "$workflow_id" \
               --arg head_branch "$HEAD_BRANCH" \
-              --argjson pr_number "$PR_NUMBER" \
+              --arg head_sha "$HEAD_SHA" \
               '.workflow_id == $workflow_id and
                .event == "pull_request" and
                .conclusion == "success" and
                .head_branch == $head_branch and
-               any(.pull_requests[]?; .number == $pr_number)' >/dev/null; then
+               .head_sha == $head_sha' >/dev/null; then
               selected="$run_id"
               break
             fi
