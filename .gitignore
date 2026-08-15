@@ -1,0 +1,5 @@
+# Local project notes and user requirements
+/.local/
+/target*/
+/dist/
+.DS_Store
