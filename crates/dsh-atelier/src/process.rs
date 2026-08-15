@@ -3,6 +3,9 @@ use std::{collections::BTreeMap, path::PathBuf, process::Stdio, time::Duration};
 use thiserror::Error;
 use tokio::{process::Command, time};
 
+#[cfg(target_os = "macos")]
+use std::os::unix::process::CommandExt as _;
+
 #[cfg(windows)]
 pub(crate) const WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -54,6 +57,8 @@ pub async fn run_once(
     }
 
     let child = command.spawn()?;
+    #[cfg(target_os = "macos")]
+    let process_group = child.id();
     #[cfg(windows)]
     let _job = {
         let job = crate::windows_job::WindowsJob::create()?;
@@ -62,7 +67,13 @@ pub async fn run_once(
     };
     let output = match time::timeout(timeout, child.wait_with_output()).await {
         Ok(result) => result?,
-        Err(_) => return Err(ProcessError::Timeout(timeout)),
+        Err(_) => {
+            #[cfg(target_os = "macos")]
+            if let Some(process_group) = process_group {
+                let _ = signal_process_group(process_group, 9);
+            }
+            return Err(ProcessError::Timeout(timeout));
+        }
     };
     let status = output.status.code().ok_or(ProcessError::MissingStatus)?;
 
@@ -78,13 +89,38 @@ fn command_for(spec: &CommandSpec) -> Result<Command, ProcessError> {
     command.args(&spec.args);
     #[cfg(windows)]
     command.creation_flags(WINDOWS_CREATE_NO_WINDOW);
+    #[cfg(target_os = "macos")]
+    command.as_std_mut().process_group(0);
     Ok(command)
+}
+
+#[cfg(target_os = "macos")]
+fn signal_process_group(process_group: u32, signal: i32) -> std::io::Result<()> {
+    unsafe extern "C" {
+        fn kill(process: i32, signal: i32) -> i32;
+    }
+
+    let process_group = i32::try_from(process_group)
+        .map_err(|_| std::io::Error::other("process group id exceeds i32"))?;
+    // SAFETY: `kill` receives a negative child process-group id and a standard
+    // signal number. It does not retain pointers or access Rust memory.
+    if unsafe { kill(-process_group, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(3) {
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, env, path::PathBuf, time::Duration};
+    use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
+    #[cfg(windows)]
+    use std::env;
     #[cfg(windows)]
     use std::fs;
 
@@ -194,6 +230,32 @@ mod tests {
             .expect_err("command should time out");
 
         assert!(matches!(error, ProcessError::Timeout(value) if value == timeout));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn timed_out_command_cannot_leave_a_descendant_running() {
+        let directory = tempdir().unwrap();
+        let marker = directory.path().join("descendant-survived.txt");
+        let spec = CommandSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".into(),
+                "(sleep 0.2; printf survived > \"$1\") & sleep 5".into(),
+                "atelier-test".into(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            current_dir: None,
+            env: BTreeMap::new(),
+        };
+
+        assert!(matches!(
+            run_once(&spec, Duration::from_millis(25)).await,
+            Err(ProcessError::Timeout(_))
+        ));
+        tokio::time::sleep(Duration::from_millis(350)).await;
+
+        assert!(!marker.exists(), "a timed-out descendant kept running");
     }
 
     #[cfg(unix)]

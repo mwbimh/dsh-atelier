@@ -24,6 +24,7 @@ use winit::{
 };
 
 use crate::{
+    atelier_update::{AtelierUpdatePhase, AtelierUpdateSnapshot},
     config::{SurfaceConfig, ThemePreference},
     controller::{ControllerPhase, ControllerSnapshot},
     dsh::update::{DshUpdatePhase, DshUpdateSnapshot},
@@ -40,15 +41,21 @@ const STOP_ID: &str = "stop";
 const RESTART_ID: &str = "restart";
 const CHECK_DSH_UPDATE_ID: &str = "check-dsh-update";
 const INSTALL_DSH_UPDATE_ID: &str = "install-dsh-update";
+const CHECK_ATELIER_UPDATE_ID: &str = "check-atelier-update";
+const INSTALL_ATELIER_UPDATE_ID: &str = "install-atelier-update";
 const EXIT_ID: &str = "exit";
 const TRAY_ICON_SIZE: u32 = 32;
 const MAX_CUSTOM_ICON_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_CUSTOM_ICON_DIMENSION: u32 = 1024;
+#[cfg(not(target_os = "macos"))]
 const BUNDLED_BLUE_ICON: &[u8] = include_bytes!("../../../assets/icons/deepseek-blue.ico");
+#[cfg(target_os = "macos")]
+const BUNDLED_BLACK_ICON: &[u8] = include_bytes!("../../../assets/icons/deepseek-black.ico");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TrayIconOrigin {
     BundledBlue,
+    BundledBlack,
     Custom(PathBuf),
 }
 
@@ -58,6 +65,7 @@ pub struct TrayIconAsset {
     width: u32,
     height: u32,
     origin: TrayIconOrigin,
+    is_template: bool,
 }
 
 pub fn load_tray_icon(atelier_root: &Path) -> Result<TrayIconAsset> {
@@ -77,6 +85,7 @@ pub fn load_tray_icon(atelier_root: &Path) -> Result<TrayIconAsset> {
                     width: TRAY_ICON_SIZE,
                     height: TRAY_ICON_SIZE,
                     origin: TrayIconOrigin::Custom(path),
+                    is_template: false,
                 });
             }
             Err(error) => {
@@ -89,13 +98,28 @@ pub fn load_tray_icon(atelier_root: &Path) -> Result<TrayIconAsset> {
 }
 
 fn bundled_tray_icon() -> Result<TrayIconAsset> {
-    let rgba = decode_icon(BUNDLED_BLUE_ICON, ImageFormat::Ico)
-        .context("decode the bundled DeepSeek blue Tray icon")?;
+    #[cfg(target_os = "macos")]
+    let (bytes, origin, description, is_template) = (
+        BUNDLED_BLACK_ICON,
+        TrayIconOrigin::BundledBlack,
+        "black",
+        true,
+    );
+    #[cfg(not(target_os = "macos"))]
+    let (bytes, origin, description, is_template) = (
+        BUNDLED_BLUE_ICON,
+        TrayIconOrigin::BundledBlue,
+        "blue",
+        false,
+    );
+    let rgba = decode_icon(bytes, ImageFormat::Ico)
+        .with_context(|| format!("decode the bundled DeepSeek {description} Tray icon"))?;
     Ok(TrayIconAsset {
         rgba,
         width: TRAY_ICON_SIZE,
         height: TRAY_ICON_SIZE,
-        origin: TrayIconOrigin::BundledBlue,
+        origin,
+        is_template,
     })
 }
 
@@ -149,6 +173,8 @@ pub enum TrayCommand {
     Restart,
     CheckDshUpdate,
     InstallDshUpdate,
+    CheckAtelierUpdate,
+    InstallAtelierUpdate,
     Exit,
 }
 
@@ -194,7 +220,17 @@ impl From<&ControllerSnapshot> for TrayStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TrayStateUpdate {
     Dsh(TrayStatus),
-    Update(DshUpdateSnapshot),
+    DshUpdate(DshUpdateSnapshot),
+    AtelierUpdate(AtelierUpdateSnapshot),
+    RestartAtelier,
+    Terminate,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TrayExitReason {
+    #[default]
+    Exit,
+    RestartForUpdate,
 }
 
 #[derive(Debug)]
@@ -222,6 +258,7 @@ pub fn run_tray(command_sender: Sender<TrayCommand>) -> Result<()> {
         bundled_tray_icon()?,
         || Ok(()),
     )
+    .map(|_| ())
 }
 
 #[derive(Clone, Debug)]
@@ -256,13 +293,13 @@ pub fn run_tray_with_ready(
     surface_host: SurfaceHostConfig,
     icon: TrayIconAsset,
     on_ready: impl FnOnce() -> Result<()> + 'static,
-) -> Result<()> {
+) -> Result<TrayExitReason> {
     let mut event_loop_builder = EventLoop::<TrayEvent>::with_user_event();
     #[cfg(target_os = "macos")]
     {
-        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+        use winit::platform::macos::EventLoopBuilderExtMacOS;
 
-        event_loop_builder.with_activation_policy(ActivationPolicy::Accessory);
+        event_loop_builder.with_activation_policy(macos_activation_policy());
     }
     let event_loop = event_loop_builder
         .build()
@@ -307,7 +344,7 @@ pub fn run_tray_with_ready(
         .context("tray event loop failed")?;
     match application.startup_error {
         Some(error) => Err(error),
-        None => Ok(()),
+        None => Ok(application.exit_reason),
     }
 }
 
@@ -317,14 +354,22 @@ fn install_menu_event_handler(proxy: EventLoopProxy<TrayEvent>) {
     }));
 }
 
+#[cfg(target_os = "macos")]
+fn macos_activation_policy() -> winit::platform::macos::ActivationPolicy {
+    winit::platform::macos::ActivationPolicy::Regular
+}
+
 struct TrayApplication {
     command_sender: Sender<TrayCommand>,
     tray: Option<TrayIcon>,
     status_item: Option<MenuItem>,
-    update_item: Option<MenuItem>,
-    check_update_item: Option<MenuItem>,
+    dsh_update_item: Option<MenuItem>,
+    check_dsh_update_item: Option<MenuItem>,
+    atelier_update_item: Option<MenuItem>,
+    check_atelier_update_item: Option<MenuItem>,
     current_status: TrayStatus,
-    current_update: DshUpdateSnapshot,
+    current_dsh_update: DshUpdateSnapshot,
+    current_atelier_update: AtelierUpdateSnapshot,
     icon: TrayIconAsset,
     surface_host: SurfaceHostConfig,
     surface: Option<DshWebSurface>,
@@ -333,6 +378,7 @@ struct TrayApplication {
     notifier: NativeNotifier,
     on_ready: Option<Box<dyn FnOnce() -> Result<()>>>,
     startup_error: Option<anyhow::Error>,
+    exit_reason: TrayExitReason,
 }
 
 impl TrayApplication {
@@ -347,10 +393,13 @@ impl TrayApplication {
             command_sender,
             tray: None,
             status_item: None,
-            update_item: None,
-            check_update_item: None,
+            dsh_update_item: None,
+            check_dsh_update_item: None,
+            atelier_update_item: None,
+            check_atelier_update_item: None,
             current_status: TrayStatus::Unknown,
-            current_update: DshUpdateSnapshot::default(),
+            current_dsh_update: DshUpdateSnapshot::default(),
+            current_atelier_update: AtelierUpdateSnapshot::default(),
             icon,
             surface_host,
             surface: None,
@@ -359,15 +408,19 @@ impl TrayApplication {
             notifier: NativeNotifier::default(),
             on_ready: Some(on_ready),
             startup_error: None,
+            exit_reason: TrayExitReason::Exit,
         }
     }
 
-    fn handle_menu(&self, id: &MenuId, event_loop: &ActiveEventLoop) {
+    fn handle_menu(&mut self, id: &MenuId, event_loop: &ActiveEventLoop) {
         let Some(command) = command_for_menu_id(id.as_ref()) else {
             return;
         };
 
         let should_exit = command == TrayCommand::Exit;
+        if should_exit {
+            self.exit_reason = TrayExitReason::Exit;
+        }
         if self.command_sender.send(command).is_err() || should_exit {
             event_loop.exit();
         }
@@ -470,12 +523,19 @@ impl ApplicationHandler<TrayEvent> for TrayApplication {
             return;
         }
 
-        match create_tray(self.current_status, &self.current_update, &self.icon) {
-            Ok((tray, status_item, update_item, check_update_item)) => {
-                self.tray = Some(tray);
-                self.status_item = Some(status_item);
-                self.update_item = Some(update_item);
-                self.check_update_item = Some(check_update_item);
+        match create_tray(
+            self.current_status,
+            &self.current_dsh_update,
+            &self.current_atelier_update,
+            &self.icon,
+        ) {
+            Ok(items) => {
+                self.tray = Some(items.tray);
+                self.status_item = Some(items.status);
+                self.dsh_update_item = Some(items.dsh_update);
+                self.check_dsh_update_item = Some(items.check_dsh_update);
+                self.atelier_update_item = Some(items.atelier_update);
+                self.check_atelier_update_item = Some(items.check_atelier_update);
                 if let Some(on_ready) = self.on_ready.take()
                     && let Err(error) = on_ready()
                 {
@@ -497,6 +557,14 @@ impl ApplicationHandler<TrayEvent> for TrayApplication {
             TrayEvent::Menu(id) => self.handle_menu(&id, event_loop),
             TrayEvent::Surface(request) => self.handle_surface_request(event_loop, request),
             TrayEvent::SurfaceAction(action) => self.handle_surface_action(action),
+            TrayEvent::State(state) if state_requests_exit(&state) => {
+                self.exit_reason = if matches!(state, TrayStateUpdate::RestartAtelier) {
+                    TrayExitReason::RestartForUpdate
+                } else {
+                    TrayExitReason::Exit
+                };
+                event_loop.exit();
+            }
             TrayEvent::State(state) => match state {
                 TrayStateUpdate::Dsh(status) => {
                     self.current_status = status;
@@ -504,19 +572,40 @@ impl ApplicationHandler<TrayEvent> for TrayApplication {
                         item.set_text(status.as_str());
                     }
                 }
-                TrayStateUpdate::Update(update) => {
-                    self.current_update = update;
-                    let presentation = update_menu_presentation(&self.current_update);
-                    if let Some(item) = &self.update_item {
+                TrayStateUpdate::DshUpdate(update) => {
+                    self.current_dsh_update = update;
+                    let presentation = update_menu_presentation(&self.current_dsh_update);
+                    if let Some(item) = &self.dsh_update_item {
                         item.set_text(&presentation.text);
                         item.set_enabled(presentation.enabled);
                     }
-                    if let Some(item) = &self.check_update_item {
+                    if let Some(item) = &self.check_dsh_update_item {
                         item.set_enabled(!matches!(
-                            self.current_update.phase,
+                            self.current_dsh_update.phase,
                             DshUpdatePhase::Checking | DshUpdatePhase::Installing
                         ));
                     }
+                }
+                TrayStateUpdate::AtelierUpdate(update) => {
+                    self.current_atelier_update = update;
+                    let presentation =
+                        atelier_update_menu_presentation(&self.current_atelier_update);
+                    if let Some(item) = &self.atelier_update_item {
+                        item.set_text(&presentation.text);
+                        item.set_enabled(presentation.enabled);
+                    }
+                    if let Some(item) = &self.check_atelier_update_item {
+                        item.set_enabled(!matches!(
+                            self.current_atelier_update.phase,
+                            AtelierUpdatePhase::Checking
+                                | AtelierUpdatePhase::Installing
+                                | AtelierUpdatePhase::RestartRequired
+                                | AtelierUpdatePhase::Disabled
+                        ));
+                    }
+                }
+                TrayStateUpdate::RestartAtelier | TrayStateUpdate::Terminate => {
+                    unreachable!("handled before state dispatch")
                 }
             },
         }
@@ -559,30 +648,66 @@ fn window_theme_override(preference: ThemePreference) -> Option<Theme> {
     }
 }
 
+fn state_requests_exit(state: &TrayStateUpdate) -> bool {
+    matches!(
+        state,
+        TrayStateUpdate::Terminate | TrayStateUpdate::RestartAtelier
+    )
+}
+
+struct TrayItems {
+    tray: TrayIcon,
+    status: MenuItem,
+    dsh_update: MenuItem,
+    check_dsh_update: MenuItem,
+    atelier_update: MenuItem,
+    check_atelier_update: MenuItem,
+}
+
 fn create_tray(
     initial_status: TrayStatus,
-    initial_update: &DshUpdateSnapshot,
+    initial_dsh_update: &DshUpdateSnapshot,
+    initial_atelier_update: &AtelierUpdateSnapshot,
     icon: &TrayIconAsset,
-) -> Result<(TrayIcon, MenuItem, MenuItem, MenuItem)> {
+) -> Result<TrayItems> {
     let menu = Menu::new();
     let status = MenuItem::with_id(STATUS_ID, initial_status.as_str(), false, None);
     let open_dsh = MenuItem::with_id(OPEN_DSH_ID, "Open DSH", true, None);
     let start = MenuItem::with_id(START_ID, "Start", true, None);
     let stop = MenuItem::with_id(STOP_ID, "Stop", true, None);
     let restart = MenuItem::with_id(RESTART_ID, "Restart", true, None);
-    let update_presentation = update_menu_presentation(initial_update);
-    let install_update = MenuItem::with_id(
+    let dsh_update_presentation = update_menu_presentation(initial_dsh_update);
+    let install_dsh_update = MenuItem::with_id(
         INSTALL_DSH_UPDATE_ID,
-        &update_presentation.text,
-        update_presentation.enabled,
+        &dsh_update_presentation.text,
+        dsh_update_presentation.enabled,
         None,
     );
-    let check_update = MenuItem::with_id(
+    let check_dsh_update = MenuItem::with_id(
         CHECK_DSH_UPDATE_ID,
         "Check for DSH updates",
         !matches!(
-            initial_update.phase,
+            initial_dsh_update.phase,
             DshUpdatePhase::Checking | DshUpdatePhase::Installing
+        ),
+        None,
+    );
+    let atelier_update_presentation = atelier_update_menu_presentation(initial_atelier_update);
+    let install_atelier_update = MenuItem::with_id(
+        INSTALL_ATELIER_UPDATE_ID,
+        &atelier_update_presentation.text,
+        atelier_update_presentation.enabled,
+        None,
+    );
+    let check_atelier_update = MenuItem::with_id(
+        CHECK_ATELIER_UPDATE_ID,
+        "Check for Atelier updates",
+        !matches!(
+            initial_atelier_update.phase,
+            AtelierUpdatePhase::Checking
+                | AtelierUpdatePhase::Installing
+                | AtelierUpdatePhase::RestartRequired
+                | AtelierUpdatePhase::Disabled
         ),
         None,
     );
@@ -594,8 +719,10 @@ fn create_tray(
         &start,
         &stop,
         &restart,
-        &install_update,
-        &check_update,
+        &install_dsh_update,
+        &check_dsh_update,
+        &install_atelier_update,
+        &check_atelier_update,
         &exit,
     ] {
         menu.append(item).context("failed to build tray menu")?;
@@ -604,13 +731,21 @@ fn create_tray(
     let tray = TrayIconBuilder::new()
         .with_tooltip("DSH Atelier")
         .with_menu(Box::new(menu))
+        .with_icon_as_template(icon.is_template)
         .with_icon(
             Icon::from_rgba(icon.rgba.clone(), icon.width, icon.height)
                 .context("Tray icon is invalid")?,
         )
         .build()
         .context("failed to create the system tray icon")?;
-    Ok((tray, status, install_update, check_update))
+    Ok(TrayItems {
+        tray,
+        status,
+        dsh_update: install_dsh_update,
+        check_dsh_update,
+        atelier_update: install_atelier_update,
+        check_atelier_update,
+    })
 }
 
 struct UpdateMenuPresentation {
@@ -644,6 +779,32 @@ fn update_menu_presentation(update: &DshUpdateSnapshot) -> UpdateMenuPresentatio
     UpdateMenuPresentation { text, enabled }
 }
 
+fn atelier_update_menu_presentation(update: &AtelierUpdateSnapshot) -> UpdateMenuPresentation {
+    let version = update
+        .available_version
+        .as_ref()
+        .or(update.current_version.as_ref())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "unknown".to_owned());
+    let (text, enabled) = match update.phase {
+        AtelierUpdatePhase::Disabled => ("Atelier updates: Disabled".to_owned(), false),
+        AtelierUpdatePhase::Idle => ("Atelier updates: Not checked".to_owned(), false),
+        AtelierUpdatePhase::Checking => ("Checking for Atelier updates…".to_owned(), false),
+        AtelierUpdatePhase::UpToDate => (format!("Atelier {version} is up to date"), false),
+        AtelierUpdatePhase::Available => (format!("Install Atelier {version}…"), true),
+        AtelierUpdatePhase::FullPackageRequired => {
+            (format!("Atelier {version} requires full download"), false)
+        }
+        AtelierUpdatePhase::Installing => (format!("Installing Atelier {version}…"), false),
+        AtelierUpdatePhase::RestartRequired => {
+            (format!("Restarting into Atelier {version}…"), false)
+        }
+        AtelierUpdatePhase::CheckFailed => ("Atelier update check failed".to_owned(), false),
+        AtelierUpdatePhase::InstallFailed => (format!("Retry Atelier {version} update…"), true),
+    };
+    UpdateMenuPresentation { text, enabled }
+}
+
 fn command_for_menu_id(id: &str) -> Option<TrayCommand> {
     match id {
         OPEN_DSH_ID => Some(TrayCommand::OpenDsh),
@@ -652,6 +813,8 @@ fn command_for_menu_id(id: &str) -> Option<TrayCommand> {
         RESTART_ID => Some(TrayCommand::Restart),
         CHECK_DSH_UPDATE_ID => Some(TrayCommand::CheckDshUpdate),
         INSTALL_DSH_UPDATE_ID => Some(TrayCommand::InstallDshUpdate),
+        CHECK_ATELIER_UPDATE_ID => Some(TrayCommand::CheckAtelierUpdate),
+        INSTALL_ATELIER_UPDATE_ID => Some(TrayCommand::InstallAtelierUpdate),
         EXIT_ID => Some(TrayCommand::Exit),
         _ => None,
     }
@@ -720,12 +883,35 @@ mod tests {
             command_for_menu_id(INSTALL_DSH_UPDATE_ID),
             Some(TrayCommand::InstallDshUpdate)
         );
+        assert_eq!(
+            command_for_menu_id(CHECK_ATELIER_UPDATE_ID),
+            Some(TrayCommand::CheckAtelierUpdate)
+        );
+        assert_eq!(
+            command_for_menu_id(INSTALL_ATELIER_UPDATE_ID),
+            Some(TrayCommand::InstallAtelierUpdate)
+        );
     }
 
     #[test]
     fn ignores_status_and_unknown_menu_ids() {
         assert_eq!(command_for_menu_id(STATUS_ID), None);
         assert_eq!(command_for_menu_id("unknown"), None);
+    }
+
+    #[test]
+    fn macos_termination_update_requests_event_loop_exit() {
+        assert!(state_requests_exit(&TrayStateUpdate::Terminate));
+        assert!(state_requests_exit(&TrayStateUpdate::RestartAtelier));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_runtime_uses_a_regular_activation_policy_for_its_dock_icon() {
+        assert!(matches!(
+            macos_activation_policy(),
+            winit::platform::macos::ActivationPolicy::Regular
+        ));
     }
 
     #[test]
@@ -739,19 +925,42 @@ mod tests {
         let icon = load_tray_icon(directory.path()).unwrap();
 
         assert_eq!(icon.origin, TrayIconOrigin::Custom(path));
+        assert!(!icon.is_template);
         assert_eq!((icon.width, icon.height), (32, 32));
         let center = ((16 * 32 + 16) * 4) as usize;
         assert_eq!(&icon.rgba[center..center + 4], &[210, 20, 30, 255]);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn invalid_custom_icon_falls_back_to_the_bundled_blue_icon() {
+    fn macos_bundled_icon_uses_the_black_template_asset() {
+        let icon = bundled_tray_icon().unwrap();
+
+        assert_eq!(icon.origin, TrayIconOrigin::BundledBlack);
+        assert!(icon.is_template);
+        let visible = icon
+            .rgba
+            .chunks_exact(4)
+            .filter(|pixel| pixel[3] > 128)
+            .collect::<Vec<_>>();
+        assert!(!visible.is_empty());
+        assert!(
+            visible
+                .iter()
+                .all(|pixel| pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0)
+        );
+    }
+
+    #[test]
+    fn invalid_custom_icon_falls_back_to_the_platform_bundled_icon() {
         let directory = tempdir().unwrap();
         fs::write(directory.path().join("icon.png"), b"not an image").unwrap();
 
         let icon = load_tray_icon(directory.path()).unwrap();
+        let bundled = bundled_tray_icon().unwrap();
 
-        assert_eq!(icon.origin, TrayIconOrigin::BundledBlue);
+        assert_eq!(icon.origin, bundled.origin);
+        assert_eq!(icon.is_template, bundled.is_template);
         assert_eq!((icon.width, icon.height), (32, 32));
         assert_eq!(icon.rgba.len(), 32 * 32 * 4);
         assert!(icon.rgba.chunks_exact(4).any(|pixel| pixel[3] != 0));
@@ -773,6 +982,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn bundled_official_icon_contains_blue_visible_pixels() {
         let icon = bundled_tray_icon().unwrap();
         let (red, green, blue) = icon
@@ -855,6 +1065,36 @@ mod tests {
         });
 
         assert_eq!(presentation.text, "DSH 0.2.0 available — update externally");
+        assert!(!presentation.enabled);
+    }
+
+    #[test]
+    fn atelier_runtime_updates_are_actionable_without_affecting_dsh_updates() {
+        let presentation =
+            atelier_update_menu_presentation(&crate::atelier_update::AtelierUpdateSnapshot {
+                phase: crate::atelier_update::AtelierUpdatePhase::Available,
+                current_version: Some(semver::Version::parse("0.1.0").unwrap()),
+                available_version: Some(semver::Version::parse("0.2.0").unwrap()),
+                min_bootstrap_generation: Some(1),
+                last_error: None,
+            });
+
+        assert_eq!(presentation.text, "Install Atelier 0.2.0…");
+        assert!(presentation.enabled);
+    }
+
+    #[test]
+    fn atelier_updates_requiring_a_new_bootstrap_use_the_full_package() {
+        let presentation =
+            atelier_update_menu_presentation(&crate::atelier_update::AtelierUpdateSnapshot {
+                phase: crate::atelier_update::AtelierUpdatePhase::FullPackageRequired,
+                current_version: Some(semver::Version::parse("0.1.0").unwrap()),
+                available_version: Some(semver::Version::parse("0.2.0").unwrap()),
+                min_bootstrap_generation: Some(2),
+                last_error: None,
+            });
+
+        assert_eq!(presentation.text, "Atelier 0.2.0 requires full download");
         assert!(!presentation.enabled);
     }
 }

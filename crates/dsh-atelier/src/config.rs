@@ -12,6 +12,10 @@ const DEFAULT_REGISTRIES: [&str; 4] = [
     "https://mirrors.cloud.tencent.com/npm/",
     "https://repo.huaweicloud.com/repository/npm/",
 ];
+const DEFAULT_ATELIER_UPDATE_FEED: &str =
+    "https://github.com/mwbimh/dsh-atelier/releases/latest/download/";
+const EMBEDDED_ATELIER_UPDATE_PUBLIC_KEY: Option<&str> =
+    option_env!("DSH_ATELIER_UPDATE_PUBLIC_KEY");
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -92,6 +96,27 @@ pub struct AtelierConfig {
     pub launch_at_login: bool,
     pub theme: ThemePreference,
     pub surface: SurfaceConfig,
+    pub update: AtelierUpdateConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AtelierUpdateConfig {
+    pub enabled: bool,
+    pub feeds: Vec<String>,
+    pub public_key: String,
+}
+
+impl Default for AtelierUpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            feeds: vec![DEFAULT_ATELIER_UPDATE_FEED.to_owned()],
+            public_key: EMBEDDED_ATELIER_UPDATE_PUBLIC_KEY
+                .unwrap_or_default()
+                .to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -149,6 +174,11 @@ mod tests {
         assert!(!config.atelier.launch_at_login);
         assert_eq!(config.atelier.theme, ThemePreference::Dark);
         assert_eq!(config.atelier.surface, SurfaceConfig::default());
+        assert!(config.atelier.update.enabled);
+        assert_eq!(
+            config.atelier.update.feeds,
+            vec!["https://github.com/mwbimh/dsh-atelier/releases/latest/download/".to_owned()]
+        );
     }
 
     #[test]
@@ -207,6 +237,33 @@ mod tests {
         .expect("older configuration remains valid");
 
         assert_eq!(config.atelier.surface, SurfaceConfig::default());
+        assert_eq!(config.atelier.update, AtelierUpdateConfig::default());
+    }
+
+    #[test]
+    fn accepts_ordered_atelier_update_feeds_and_a_public_key() {
+        let config = Config::from_toml(
+            r#"
+                [atelier.update]
+                enabled = true
+                public_key = "AQID"
+                feeds = [
+                    "https://updates.example.com/stable/",
+                    "https://github.com/mwbimh/dsh-atelier/releases/latest/download/",
+                ]
+            "#,
+        )
+        .expect("custom Atelier update feeds parse");
+
+        assert!(config.atelier.update.enabled);
+        assert_eq!(config.atelier.update.public_key, "AQID");
+        assert_eq!(
+            config.atelier.update.feeds,
+            vec![
+                "https://updates.example.com/stable/",
+                "https://github.com/mwbimh/dsh-atelier/releases/latest/download/",
+            ]
+        );
     }
 
     #[test]

@@ -423,7 +423,8 @@ mod macos {
         surface::ExternalUrl,
     };
 
-    const LAUNCH_AGENT_NAME: &str = "com.dsh-atelier.plist";
+    const BUNDLE_IDENTIFIER: &str = "com.deepseek-harness.atelier";
+    const LAUNCH_AGENT_NAME: &str = "com.deepseek-harness.atelier.plist";
 
     #[derive(Clone, Copy, Debug, Default)]
     pub struct MacBrowser;
@@ -439,10 +440,13 @@ mod macos {
     }
 
     fn open_in_default_browser(value: &str) -> Result<(), PlatformError> {
-        run_command(
-            Command::new("/usr/bin/open").arg(value),
-            "open the default browser",
-        )
+        run_command(&mut browser_command(value), "open the default browser")
+    }
+
+    fn browser_command(url: &str) -> Command {
+        let mut command = Command::new("/usr/bin/open");
+        command.arg(url);
+        command
     }
 
     #[derive(Clone, Copy, Debug, Default)]
@@ -450,19 +454,26 @@ mod macos {
 
     impl Notifier for MacNotifier {
         fn notify(&self, title: &str, body: &str) -> Result<(), PlatformError> {
-            let mut command = Command::new("/usr/bin/osascript");
-            command
-                .arg("-e")
-                .arg("on run argv")
-                .arg("-e")
-                .arg("display notification (item 2 of argv) with title (item 1 of argv)")
-                .arg("-e")
-                .arg("end run")
-                .arg("--")
-                .arg(title)
-                .arg(body);
-            run_command(&mut command, "show a macOS notification")
+            run_command(
+                &mut notification_command(title, body),
+                "show a macOS notification",
+            )
         }
+    }
+
+    fn notification_command(title: &str, body: &str) -> Command {
+        let mut command = Command::new("/usr/bin/osascript");
+        command
+            .arg("-e")
+            .arg("on run argv")
+            .arg("-e")
+            .arg("display notification (item 2 of argv) with title (item 1 of argv)")
+            .arg("-e")
+            .arg("end run")
+            .arg("--")
+            .arg(title)
+            .arg(body);
+        command
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -508,11 +519,14 @@ mod macos {
             })?;
             fs::create_dir_all(directory)
                 .map_err(|error| io_error("failed to create the LaunchAgents directory", error))?;
-            fs::write(
-                &self.launch_agent_path,
-                launch_agent_plist(&self.executable),
-            )
-            .map_err(|error| io_error("failed to write the LaunchAgent plist", error))
+            let temporary = self.launch_agent_path.with_extension("plist.tmp");
+            fs::write(&temporary, launch_agent_plist(&self.executable))
+                .map_err(|error| io_error("failed to write the LaunchAgent plist", error))?;
+            if let Err(error) = fs::rename(&temporary, &self.launch_agent_path) {
+                let _ = fs::remove_file(&temporary);
+                return Err(io_error("failed to activate the LaunchAgent plist", error));
+            }
+            Ok(())
         }
 
         fn disable(&self) -> Result<(), PlatformError> {
@@ -557,21 +571,56 @@ mod macos {
     }
 
     fn launch_agent_plist(executable: &Path) -> String {
-        let executable = escape_xml(&executable.to_string_lossy());
+        let arguments = launch_agent_program_arguments(executable)
+            .into_iter()
+            .map(|argument| format!("<string>{}</string>", escape_xml(&argument)))
+            .collect::<String>();
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
              <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
              \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
              <plist version=\"1.0\">\n\
              <dict>\n\
-               <key>Label</key><string>com.dsh-atelier</string>\n\
+               <key>Label</key><string>{BUNDLE_IDENTIFIER}</string>\n\
                <key>ProgramArguments</key>\n\
-               <array><string>{executable}</string><string>--autostart</string></array>\n\
+               <array>{arguments}</array>\n\
                <key>RunAtLoad</key><true/>\n\
                <key>KeepAlive</key><false/>\n\
+               <key>LimitLoadToSessionType</key><string>Aqua</string>\n\
+               <key>ProcessType</key><string>Interactive</string>\n\
              </dict>\n\
              </plist>\n"
         )
+    }
+
+    fn launch_agent_program_arguments(executable: &Path) -> Vec<String> {
+        if let Some(app_bundle) = app_bundle_for_executable(executable) {
+            vec![
+                "/usr/bin/open".to_owned(),
+                "-n".to_owned(),
+                app_bundle.to_string_lossy().into_owned(),
+                "--args".to_owned(),
+                "--autostart".to_owned(),
+            ]
+        } else {
+            vec![
+                executable.to_string_lossy().into_owned(),
+                "--autostart".to_owned(),
+            ]
+        }
+    }
+
+    fn app_bundle_for_executable(executable: &Path) -> Option<&Path> {
+        let macos = executable.parent()?;
+        if macos.file_name()? != "MacOS" {
+            return None;
+        }
+        let contents = macos.parent()?;
+        if contents.file_name()? != "Contents" {
+            return None;
+        }
+        let app = contents.parent()?;
+        (app.extension()? == "app").then_some(app)
     }
 
     fn escape_xml(value: &str) -> String {
@@ -581,5 +630,90 @@ mod macos {
             .replace('>', "&gt;")
             .replace('"', "&quot;")
             .replace('\'', "&apos;")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::{fs, path::Path};
+
+        use tempfile::tempdir;
+
+        use super::{
+            MacAutostart, browser_command, launch_agent_plist, launch_agent_program_arguments,
+            notification_command,
+        };
+        use crate::ports::Autostart;
+        use crate::{dsh::readiness::LoopbackUrl, surface::ExternalUrl};
+
+        #[test]
+        fn bundled_login_launch_uses_launch_services_and_the_bundle_identifier() {
+            let executable =
+                Path::new("/Applications/DSH & Atelier.app/Contents/MacOS/DSH Atelier");
+
+            assert_eq!(
+                launch_agent_program_arguments(executable),
+                [
+                    "/usr/bin/open",
+                    "-n",
+                    "/Applications/DSH & Atelier.app",
+                    "--args",
+                    "--autostart",
+                ]
+            );
+            let plist = launch_agent_plist(executable);
+            assert!(plist.contains("com.deepseek-harness.atelier"));
+            assert!(plist.contains("/Applications/DSH &amp; Atelier.app"));
+            assert!(plist.contains("<string>Aqua</string>"));
+        }
+
+        #[test]
+        fn enabling_and_disabling_only_changes_the_injected_launch_agent() {
+            let directory = tempdir().unwrap();
+            let executable = directory.path().join("dsh-atelier");
+            fs::write(&executable, []).unwrap();
+            let adapter = MacAutostart::from_paths(&executable, directory.path());
+
+            adapter.set_enabled(true).unwrap();
+            assert!(adapter.is_enabled().unwrap());
+            assert!(adapter.launch_agent_path().is_file());
+            adapter.set_enabled(true).unwrap();
+
+            adapter.set_enabled(false).unwrap();
+            assert!(!adapter.is_enabled().unwrap());
+        }
+
+        #[test]
+        fn browser_command_opens_only_the_validated_loopback_url() {
+            let url = LoopbackUrl::parse("http://127.0.0.1:24888").unwrap();
+            let command = browser_command(url.as_str());
+
+            assert_eq!(command.get_program(), "/usr/bin/open");
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                [std::ffi::OsStr::new("http://127.0.0.1:24888/")]
+            );
+        }
+
+        #[test]
+        fn browser_command_opens_validated_external_urls_without_a_shell() {
+            let url = ExternalUrl::parse("https://example.com/docs?q=surface").unwrap();
+            let command = browser_command(url.as_str());
+
+            assert_eq!(command.get_program(), "/usr/bin/open");
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                [std::ffi::OsStr::new("https://example.com/docs?q=surface")]
+            );
+        }
+
+        #[test]
+        fn notification_text_is_passed_as_argv_not_applescript_source() {
+            let command = notification_command("title \"quoted\"", "body; do shell script");
+            let arguments = command.get_args().collect::<Vec<_>>();
+
+            assert_eq!(command.get_program(), "/usr/bin/osascript");
+            assert_eq!(arguments[arguments.len() - 2], "title \"quoted\"");
+            assert_eq!(arguments[arguments.len() - 1], "body; do shell script");
+        }
     }
 }

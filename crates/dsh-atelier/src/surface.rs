@@ -25,6 +25,9 @@ use winit::{
     window::ResizeDirection,
 };
 
+#[cfg(target_os = "macos")]
+use winit::platform::macos::WindowAttributesExtMacOS;
+
 #[cfg(windows)]
 use windows::Win32::{
     Foundation::{COLORREF, HWND, LPARAM, LRESULT, WPARAM},
@@ -45,6 +48,7 @@ const INITIAL_HEIGHT: f64 = 760.0;
 const MINIMUM_WIDTH: f64 = 720.0;
 const MINIMUM_HEIGHT: f64 = 480.0;
 const TOOLBAR_HEIGHT: f64 = 42.0;
+#[cfg(windows)]
 const WINDOWS_RESIZE_GUTTER: f64 = 6.0;
 const MAX_CUSTOM_ICON_BYTES: u64 = 4 * 1024 * 1024;
 const SURFACE_WINDOW_ICON: &[u8] = include_bytes!("../../../assets/icons/deepseek-black.ico");
@@ -687,8 +691,9 @@ impl DshWebSurface {
         })?;
         let presentation = SurfacePresentation::load(atelier_root, surface_config)?;
         let window_icon = surface_window_icon()?;
+        #[cfg(windows)]
         let initial_theme = resolve_theme(theme_override);
-        let mut attributes = Window::default_attributes()
+        let attributes = Window::default_attributes()
             .with_title(&presentation.title)
             .with_window_icon(Some(window_icon))
             .with_inner_size(LogicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))
@@ -696,13 +701,16 @@ impl DshWebSurface {
             .with_decorations(!cfg!(windows))
             .with_theme(theme_override)
             .with_visible(false);
+        #[cfg(target_os = "macos")]
+        let attributes = attributes
+            .with_title_hidden(true)
+            .with_titlebar_transparent(true)
+            .with_fullsize_content_view(true);
         #[cfg(windows)]
-        {
-            attributes = attributes
-                .with_class_name("DshAtelierSurfaceWindow")
-                .with_clip_children(true)
-                .with_border_color(Some(native_window_color(initial_theme)));
-        }
+        let attributes = attributes
+            .with_class_name("DshAtelierSurfaceWindow")
+            .with_clip_children(true)
+            .with_border_color(Some(native_window_color(initial_theme)));
         let window = event_loop
             .create_window(attributes)
             .context("failed to create the DSH Surface window")?;

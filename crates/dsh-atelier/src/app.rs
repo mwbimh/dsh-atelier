@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     sync::{Arc, mpsc::Sender},
@@ -14,7 +15,10 @@ use tokio::sync::Mutex;
 use crate::{
     controller::{ControllerHandle, ControllerServices},
     dsh::{
-        discovery::{CandidateSource, DiscoveredDsh, discover_candidates, discover_dsh},
+        discovery::{
+            CandidateSource, DiscoveredDsh, DshCandidate, desktop_search_path, discover_candidates,
+            parse_dsh_version,
+        },
         readiness::LoopbackUrl,
         supervisor::{DshState, DshSupervisor, SupervisorOptions},
         update::{
@@ -34,12 +38,85 @@ use crate::{
     paths::AtelierPaths,
     platform::{NativeBrowser, NativeNotifier},
     ports::{Browser, Notifier},
-    process::CommandSpec,
+    process::{CommandSpec, run_once},
     registry::{DSH_PACKAGE_NAME, REGISTRY_CONNECT_TIMEOUT, REGISTRY_REQUEST_TIMEOUT},
     surface::SurfaceRequest,
 };
 
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DshCommand {
+    program: PathBuf,
+    leading_args: Vec<String>,
+    env: BTreeMap<String, String>,
+}
+
+impl DshCommand {
+    fn external(dsh_program: impl Into<PathBuf>) -> Self {
+        Self {
+            program: dsh_program.into(),
+            leading_args: Vec::new(),
+            env: BTreeMap::new(),
+        }
+    }
+
+    fn with_search_path(mut self, search_path: &std::ffi::OsStr) -> Self {
+        self.env.insert(
+            "PATH".to_owned(),
+            search_path.to_string_lossy().into_owned(),
+        );
+        self
+    }
+
+    fn managed(node_program: impl Into<PathBuf>, dsh_script: impl Into<PathBuf>) -> Self {
+        let node_program = node_program.into();
+        let dsh_script = dsh_script.into();
+        let inherited = desktop_search_path(env::var_os("PATH").as_deref());
+        let mut directories = node_program
+            .parent()
+            .map(Path::to_path_buf)
+            .into_iter()
+            .collect::<Vec<_>>();
+        directories.extend(env::split_paths(&inherited));
+        deduplicate_paths(&mut directories);
+        let search_path = env::join_paths(directories).unwrap_or(inherited);
+        #[cfg(windows)]
+        let command = Self::external(dsh_script);
+        #[cfg(not(windows))]
+        let command = Self {
+            program: node_program,
+            leading_args: vec![dsh_script.to_string_lossy().into_owned()],
+            env: BTreeMap::new(),
+        };
+        command.with_search_path(&search_path)
+    }
+
+    fn version_spec(&self) -> CommandSpec {
+        self.spec(&["--version"])
+    }
+
+    fn web_spec(&self) -> CommandSpec {
+        self.spec(&["web", "--host", "127.0.0.1", "--port", "0"])
+    }
+
+    fn spec(&self, args: &[&str]) -> CommandSpec {
+        let mut command_args = self.leading_args.clone();
+        command_args.extend(args.iter().map(|argument| (*argument).to_owned()));
+        CommandSpec {
+            program: self.program.clone(),
+            args: command_args,
+            current_dir: None,
+            env: self.env.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SelectedDsh {
+    discovered: DiscoveredDsh,
+    command: DshCommand,
+}
 
 struct RunningDsh {
     supervisor: DshSupervisor,
@@ -135,8 +212,8 @@ impl ControllerServices for RuntimeServices {
         }
         let selected = resolve_dsh(&self.paths).await?;
         self.updater.check_after_start(CurrentDsh {
-            version: selected.version.clone(),
-            source: if selected.source == CandidateSource::Managed {
+            version: selected.discovered.version.clone(),
+            source: if selected.discovered.source == CandidateSource::Managed {
                 DshUpdateSource::Managed
             } else {
                 DshUpdateSource::External
@@ -147,7 +224,7 @@ impl ControllerServices for RuntimeServices {
             Ok((supervisor, url)) => (selected, supervisor, url),
             Err(update_error) if is_pending_activation => {
                 tracing::error!(
-                    version = %selected.version,
+                    version = %selected.discovered.version,
                     error = %update_error,
                     "pending DSH failed readiness; rolling back"
                 );
@@ -155,7 +232,7 @@ impl ControllerServices for RuntimeServices {
                 let fallback = resolve_dsh(&self.paths)
                     .await
                     .context("resolve the previous DSH after update failure")?;
-                if fallback.program == selected.program {
+                if fallback.discovered.program == selected.discovered.program {
                     return Err(update_error).context("start pending DSH update");
                 }
                 self.updater
@@ -163,14 +240,14 @@ impl ControllerServices for RuntimeServices {
                 let (supervisor, url) = start_selected_dsh(&fallback).await.with_context(|| {
                     format!(
                         "pending DSH {} failed ({update_error:#}); rollback DSH {} also failed",
-                        selected.version, fallback.version
+                        selected.discovered.version, fallback.discovered.version
                     )
                 })?;
                 let _ = self.notifier.notify(
                     "DSH update rolled back",
                     &format!(
                         "DSH {} could not start. Atelier restored DSH {}.",
-                        selected.version, fallback.version
+                        selected.discovered.version, fallback.discovered.version
                     ),
                 );
                 (fallback, supervisor, url)
@@ -178,7 +255,7 @@ impl ControllerServices for RuntimeServices {
             Err(error) => return Err(error).context("start managed DSH Web"),
         };
         if is_managed_selection(&self.paths, &selected) {
-            commit_managed_activation(&self.paths, &selected.version)?;
+            commit_managed_activation(&self.paths, &selected.discovered.version)?;
         }
         *self.supervisor.lock().await = Some(RunningDsh {
             supervisor,
@@ -240,10 +317,10 @@ impl DshUpdateBackend for RuntimeUpdateBackend {
 
     async fn install_release(&self, release: &LocatedRelease) -> Result<InstalledDshUpdate> {
         let selected = install_managed_release(&self.paths, release).await?;
-        write_pending_dsh(&self.paths, &selected.version)?;
+        write_pending_dsh(&self.paths, &selected.discovered.version)?;
         Ok(InstalledDshUpdate {
-            version: selected.version,
-            program: selected.program,
+            version: selected.discovered.version,
+            program: selected.discovered.program,
         })
     }
 
@@ -255,12 +332,13 @@ impl DshUpdateBackend for RuntimeUpdateBackend {
 }
 
 pub async fn ensure_dsh(paths: &AtelierPaths) -> Result<PathBuf> {
-    Ok(resolve_dsh(paths).await?.program)
+    Ok(resolve_dsh(paths).await?.discovered.program)
 }
 
-async fn resolve_dsh(paths: &AtelierPaths) -> Result<DiscoveredDsh> {
+async fn resolve_dsh(paths: &AtelierPaths) -> Result<SelectedDsh> {
     create_atelier_directories(paths)?;
     let cwd = env::current_dir().context("resolve current directory")?;
+    let search_path = desktop_search_path(env::var_os("PATH").as_deref());
     let pending = read_pending_dsh(paths)?
         .map(|version| managed_dsh_program(&managed_dsh_version_dir(paths, &version)))
         .filter(|program| program.is_file());
@@ -271,21 +349,93 @@ async fn resolve_dsh(paths: &AtelierPaths) -> Result<DiscoveredDsh> {
     let candidates = discover_candidates(
         pending.as_deref(),
         active.as_deref(),
-        env::var_os("PATH").as_deref(),
+        Some(search_path.as_os_str()),
         env::var_os("PATHEXT").as_deref(),
         &cwd,
     );
-    if let Some(mut discovered) = discover_dsh(&candidates, Duration::from_secs(5))
-        .await
-        .selected
-    {
-        if is_managed_selection(paths, &discovered) {
-            discovered.source = CandidateSource::Managed;
+    let managed_nodes = existing_nodes_for_managed_dsh(paths, search_path.as_os_str());
+    for mut candidate in candidates {
+        if is_managed_program(paths, &candidate.program) {
+            candidate.source = CandidateSource::Managed;
+            if managed_nodes.is_empty() {
+                tracing::warn!(
+                    dsh = %candidate.program.display(),
+                    "cannot probe managed DSH without a selected Node executable"
+                );
+                continue;
+            }
+            for node_program in &managed_nodes {
+                let Ok(probed_node) = probe_node(node_program).await else {
+                    continue;
+                };
+                if !node_version_is_compatible(&probed_node.version) {
+                    continue;
+                }
+                let command = DshCommand::managed(node_program, &candidate.program);
+                if let Some(selected) =
+                    discover_dsh_with_command(&candidate, command, Duration::from_secs(5)).await
+                {
+                    return Ok(selected);
+                }
+            }
+        } else {
+            let command =
+                DshCommand::external(&candidate.program).with_search_path(search_path.as_os_str());
+            if let Some(selected) =
+                discover_dsh_with_command(&candidate, command, Duration::from_secs(5)).await
+            {
+                return Ok(selected);
+            }
         }
-        return Ok(discovered);
     }
 
     install_managed_dsh(paths).await
+}
+
+async fn discover_dsh_with_command(
+    candidate: &DshCandidate,
+    command: DshCommand,
+    timeout: Duration,
+) -> Option<SelectedDsh> {
+    let output = match run_once(&command.version_spec(), timeout).await {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::warn!(
+                dsh = %candidate.program.display(),
+                %error,
+                "failed to probe DSH candidate"
+            );
+            return None;
+        }
+    };
+    if output.status != 0 {
+        tracing::warn!(
+            dsh = %candidate.program.display(),
+            status = output.status,
+            stderr = %output.stderr.trim(),
+            "DSH candidate version probe failed"
+        );
+        return None;
+    }
+    let version = match parse_dsh_version(&output.stdout) {
+        Ok(version) => version,
+        Err(error) => {
+            tracing::warn!(
+                dsh = %candidate.program.display(),
+                %error,
+                "DSH candidate returned an invalid version"
+            );
+            return None;
+        }
+    };
+    Some(SelectedDsh {
+        discovered: DiscoveredDsh {
+            program: candidate.program.clone(),
+            version,
+            source: candidate.source,
+        },
+        command,
+    })
 }
 
 fn create_atelier_directories(paths: &AtelierPaths) -> Result<()> {
@@ -417,20 +567,25 @@ fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     fs::rename(&temporary, path).with_context(|| format!("activate state file {}", path.display()))
 }
 
-fn is_managed_selection(paths: &AtelierPaths, selected: &DiscoveredDsh) -> bool {
+fn is_managed_program(paths: &AtelierPaths, program: &Path) -> bool {
+    program.starts_with(paths.dsh_installations_dir.join("versions"))
+}
+
+fn is_managed_selection(paths: &AtelierPaths, selected: &SelectedDsh) -> bool {
     selected
+        .discovered
         .program
         .starts_with(paths.dsh_installations_dir.join("versions"))
 }
 
-fn is_pending_managed_selection(paths: &AtelierPaths, selected: &DiscoveredDsh) -> Result<bool> {
+fn is_pending_managed_selection(paths: &AtelierPaths, selected: &SelectedDsh) -> Result<bool> {
     Ok(is_managed_selection(paths, selected)
-        && read_pending_dsh(paths)?.as_ref() == Some(&selected.version))
+        && read_pending_dsh(paths)?.as_ref() == Some(&selected.discovered.version))
 }
 
-fn current_dsh(paths: &AtelierPaths, selected: &DiscoveredDsh) -> CurrentDsh {
+fn current_dsh(paths: &AtelierPaths, selected: &SelectedDsh) -> CurrentDsh {
     CurrentDsh {
-        version: selected.version.clone(),
+        version: selected.discovered.version.clone(),
         source: if is_managed_selection(paths, selected) {
             DshUpdateSource::Managed
         } else {
@@ -439,20 +594,9 @@ fn current_dsh(paths: &AtelierPaths, selected: &DiscoveredDsh) -> CurrentDsh {
     }
 }
 
-async fn start_selected_dsh(selected: &DiscoveredDsh) -> Result<(DshSupervisor, LoopbackUrl)> {
-    let spec = CommandSpec {
-        program: selected.program.clone(),
-        args: vec![
-            "web".to_owned(),
-            "--host".to_owned(),
-            "127.0.0.1".to_owned(),
-            "--port".to_owned(),
-            "0".to_owned(),
-        ],
-        current_dir: None,
-        env: Default::default(),
-    };
-    let mut supervisor = DshSupervisor::new(spec, SupervisorOptions::default());
+async fn start_selected_dsh(selected: &SelectedDsh) -> Result<(DshSupervisor, LoopbackUrl)> {
+    let mut supervisor =
+        DshSupervisor::new(selected.command.web_spec(), SupervisorOptions::default());
     let url = supervisor.start().await?;
     Ok((supervisor, url))
 }
@@ -493,7 +637,7 @@ async fn lookup_latest_dsh_release() -> Result<LocatedRelease> {
     .context("resolve latest DSH from npm")
 }
 
-async fn install_managed_dsh(paths: &AtelierPaths) -> Result<DiscoveredDsh> {
+async fn install_managed_dsh(paths: &AtelierPaths) -> Result<SelectedDsh> {
     let located = lookup_latest_dsh_release().await?;
     install_managed_release(paths, &located).await
 }
@@ -501,19 +645,23 @@ async fn install_managed_dsh(paths: &AtelierPaths) -> Result<DiscoveredDsh> {
 async fn install_managed_release(
     paths: &AtelierPaths,
     located: &LocatedRelease,
-) -> Result<DiscoveredDsh> {
+) -> Result<SelectedDsh> {
     let layout = ManagedDshLayout::from_paths(paths);
     let final_program = managed_dsh_program(&layout.version_dir(&located.release.version));
-    if final_program.is_file() {
-        return Ok(DiscoveredDsh {
-            program: final_program,
-            version: located.release.version.clone(),
-            source: CandidateSource::Managed,
-        });
-    }
-
     let toolchain =
         ensure_node_toolchain_for(paths, located.release.engines_node.as_deref()).await?;
+    let final_command =
+        DshCommand::managed(toolchain.node_executable.clone(), final_program.clone());
+    if final_program.is_file() {
+        return Ok(SelectedDsh {
+            discovered: DiscoveredDsh {
+                program: final_program,
+                version: located.release.version.clone(),
+                source: CandidateSource::Managed,
+            },
+            command: final_command,
+        });
+    }
 
     let stale_staging = layout.staging_dir.join(located.release.version.to_string());
     if stale_staging.exists() {
@@ -522,8 +670,8 @@ async fn install_managed_release(
     }
     let staged = layout.begin(&located.release.version)?;
     let npm = NpmCli::new(
-        toolchain.node_executable,
-        toolchain.npm_cli,
+        toolchain.node_executable.clone(),
+        toolchain.npm_cli.clone(),
         layout.npm.clone(),
     );
     let registries = default_registry_endpoints();
@@ -543,25 +691,26 @@ async fn install_managed_release(
     .await
     .context("install DSH through npm")?;
     let program = staged.managed_program();
-    let report = discover_dsh(
-        &[crate::dsh::discovery::DshCandidate {
-            program: program.clone(),
-            source: crate::dsh::discovery::CandidateSource::Managed,
-        }],
+    let command = DshCommand::managed(toolchain.node_executable.clone(), program.clone());
+    discover_dsh_with_command(
+        &DshCandidate {
+            program,
+            source: CandidateSource::Managed,
+        },
+        command,
         Duration::from_secs(10),
     )
-    .await;
-    if report.selected.is_none() {
-        bail!(
-            "installed DSH failed version validation: {:?}",
-            report.failures
-        );
-    }
+    .await
+    .ok_or_else(|| anyhow::anyhow!("installed DSH failed version validation"))?;
     let installed = staged.promote()?;
-    Ok(DiscoveredDsh {
-        program: installed.managed_program(),
-        version: installed.version,
-        source: CandidateSource::Managed,
+    let installed_program = installed.managed_program();
+    Ok(SelectedDsh {
+        discovered: DiscoveredDsh {
+            program: installed_program.clone(),
+            version: installed.version,
+            source: CandidateSource::Managed,
+        },
+        command: DshCommand::managed(toolchain.node_executable, installed_program),
     })
 }
 
@@ -576,9 +725,12 @@ async fn ensure_node_toolchain_for(
     if managed_node.is_file() {
         node_candidates.push(managed_node.clone());
     }
-    if let Some(system_node) = find_in_path(if cfg!(windows) { "node.exe" } else { "node" }) {
-        node_candidates.push(system_node);
-    }
+    let search_path = desktop_search_path(env::var_os("PATH").as_deref());
+    node_candidates.extend(find_all_in_path(
+        if cfg!(windows) { "node.exe" } else { "node" },
+        search_path.as_os_str(),
+    ));
+    deduplicate_paths(&mut node_candidates);
     for candidate in node_candidates {
         if let Ok(probed) = probe_node(&candidate).await
             && node_version_is_compatible(&probed.version)
@@ -627,11 +779,37 @@ fn node_satisfies_engine_requirement(
         })
 }
 
-fn find_in_path(name: &str) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-    env::split_paths(&path)
+fn existing_nodes_for_managed_dsh(
+    paths: &AtelierPaths,
+    search_path: &std::ffi::OsStr,
+) -> Vec<PathBuf> {
+    let Ok(distribution) = NodeDistribution::default_for_current_platform() else {
+        return Vec::new();
+    };
+    let managed_node =
+        managed_node_root(paths, &distribution).join(distribution.node_relative_path());
+    let mut candidates = Vec::new();
+    if managed_node.is_file() {
+        candidates.push(managed_node);
+    }
+    candidates.extend(find_all_in_path(
+        if cfg!(windows) { "node.exe" } else { "node" },
+        search_path,
+    ));
+    deduplicate_paths(&mut candidates);
+    candidates
+}
+
+fn deduplicate_paths(paths: &mut Vec<PathBuf>) {
+    let mut seen = HashSet::new();
+    paths.retain(|path| seen.insert(path.clone()));
+}
+
+fn find_all_in_path(name: &str, path: &std::ffi::OsStr) -> Vec<PathBuf> {
+    env::split_paths(path)
         .map(|directory| directory.join(name))
-        .find(|candidate| candidate.is_file())
+        .filter(|candidate| candidate.is_file())
+        .collect()
 }
 
 fn managed_node_root(paths: &AtelierPaths, distribution: &NodeDistribution) -> PathBuf {
@@ -701,13 +879,100 @@ async fn install_managed_node(
 mod tests {
     use super::*;
 
+    #[cfg(not(windows))]
+    #[test]
+    fn managed_dsh_specs_run_the_script_through_the_selected_node() {
+        let command = DshCommand::managed("/atelier/node/bin/node", "/atelier/dsh/bin/dsh");
+        let version = command.version_spec();
+        let web = command.web_spec();
+
+        assert_eq!(version.program, PathBuf::from("/atelier/node/bin/node"));
+        assert_eq!(version.args, ["/atelier/dsh/bin/dsh", "--version"]);
+        assert_eq!(web.program, version.program);
+        assert_eq!(
+            web.args,
+            [
+                "/atelier/dsh/bin/dsh",
+                "web",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "0",
+            ]
+        );
+        assert_eq!(&web.env, &version.env);
+        let search_path = version.env["PATH"].clone();
+        assert_eq!(
+            env::split_paths(std::ffi::OsStr::new(&search_path)).next(),
+            Some(PathBuf::from("/atelier/node/bin"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn managed_windows_dsh_specs_keep_executing_the_cmd_shim_directly() {
+        let command = DshCommand::managed("C:/atelier/node/node.exe", "C:/atelier/dsh/dsh.cmd");
+
+        assert_eq!(
+            command.version_spec().program,
+            PathBuf::from("C:/atelier/dsh/dsh.cmd")
+        );
+        assert_eq!(command.version_spec().args, ["--version"]);
+        let search_path = command.version_spec().env["PATH"].clone();
+        assert_eq!(
+            env::split_paths(std::ffi::OsStr::new(&search_path)).next(),
+            Some(PathBuf::from("C:/atelier/node"))
+        );
+    }
+
+    #[test]
+    fn external_dsh_specs_execute_the_discovered_program_directly() {
+        let search_path = std::ffi::OsStr::new("/usr/bin:/opt/homebrew/bin:/usr/local/bin");
+        let command = DshCommand::external("/opt/homebrew/bin/dsh").with_search_path(search_path);
+
+        assert_eq!(
+            command.version_spec(),
+            CommandSpec {
+                program: PathBuf::from("/opt/homebrew/bin/dsh"),
+                args: vec!["--version".into()],
+                current_dir: None,
+                env: BTreeMap::from([("PATH".into(), search_path.to_string_lossy().into_owned(),)]),
+            }
+        );
+        assert_eq!(command.web_spec().program, command.version_spec().program);
+        assert_eq!(
+            command.web_spec().args,
+            ["web", "--host", "127.0.0.1", "--port", "0"]
+        );
+        assert_eq!(command.web_spec().env, command.version_spec().env);
+    }
+
+    #[test]
+    fn node_search_keeps_all_candidates_in_path_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let old = directory.path().join("old");
+        let compatible = directory.path().join("compatible");
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&compatible).unwrap();
+        let node_name = if cfg!(windows) { "node.exe" } else { "node" };
+        fs::write(old.join(node_name), b"old node").unwrap();
+        fs::write(compatible.join(node_name), b"compatible node").unwrap();
+        let search_path = env::join_paths([&old, &compatible]).unwrap();
+
+        assert_eq!(
+            find_all_in_path(node_name, &search_path),
+            vec![old.join(node_name), compatible.join(node_name)]
+        );
+    }
+
     #[test]
     fn selects_the_highest_valid_managed_dsh_version() {
         let directory = tempfile::tempdir().unwrap();
         for version in ["0.1.0-rc.5", "0.1.0-rc.6", "not-a-version"] {
             let root = directory.path().join("versions").join(version);
-            fs::create_dir_all(&root).unwrap();
-            fs::write(managed_dsh_program(&root), b"shim").unwrap();
+            let program = managed_dsh_program(&root);
+            fs::create_dir_all(program.parent().unwrap()).unwrap();
+            fs::write(program, b"shim").unwrap();
         }
 
         let selected = newest_managed_dsh(directory.path()).unwrap();

@@ -1,0 +1,718 @@
+name: Release
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - closed
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: >-
+    ${{ github.event_name == 'pull_request' &&
+        format('release-pr-{0}', github.event.pull_request.number) ||
+        format('release-manual-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name != 'pull_request' || github.event.action != 'closed' }}
+
+jobs:
+  prepare:
+    name: Validate release candidate
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.action != 'closed' &&
+       startsWith(github.event.pull_request.head.ref, 'release/') &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_name: ${{ steps.metadata.outputs.artifact_name }}
+      candidate_id: ${{ steps.metadata.outputs.candidate_id }}
+      release_branch: ${{ steps.metadata.outputs.release_branch }}
+      source_sha: ${{ steps.metadata.outputs.source_sha }}
+      source_tree: ${{ steps.metadata.outputs.source_tree }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      update_public_key: ${{ steps.metadata.outputs.update_public_key }}
+      update_public_key_sha256: ${{ steps.metadata.outputs.update_public_key_sha256 }}
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - name: Check out candidate source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.92.0
+
+      - name: Validate version, tag, and changelog
+        id: metadata
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RELEASE_BRANCH: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+          SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          UPDATE_PUBLIC_KEY: ${{ vars.DSH_ATELIER_UPDATE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+
+          cargo metadata --locked --no-deps --format-version 1 > metadata.json
+          runtime_version=$(jq -er '.packages[] | select(.name == "dsh-atelier") | .version' metadata.json)
+          bootstrap_version=$(jq -er '.packages[] | select(.name == "atelier-bootstrap") | .version' metadata.json)
+
+          test "$runtime_version" = "$bootstrap_version"
+          if [[ ! "$runtime_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release version must be stable SemVer: $runtime_version" >&2
+            exit 1
+          fi
+          if [[ ! "$RELEASE_BRANCH" =~ ^release/(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "release source branch must be release/x.y.z: $RELEASE_BRANCH" >&2
+            exit 1
+          fi
+          branch_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+          if [[ "$branch_version" != "$runtime_version" ]]; then
+            echo "release branch version $branch_version does not match crate version $runtime_version" >&2
+            exit 1
+          fi
+
+          update_public_key=$(printf '%s' "$UPDATE_PUBLIC_KEY" | tr -d '[:space:]')
+          update_public_key_raw="$RUNNER_TEMP/update-public-key.raw"
+          printf '%s' "$update_public_key" | base64 --decode > "$update_public_key_raw"
+          test "$(stat -c '%s' "$update_public_key_raw")" = "32"
+          update_public_key_sha256=$(sha256sum "$update_public_key_raw" | awk '{print $1}')
+
+          tag="v$runtime_version"
+          if git rev-parse --quiet --verify "refs/tags/$tag" >/dev/null; then
+            echo "release tag already exists: $tag" >&2
+            exit 1
+          fi
+
+          test -f CHANGELOG.md
+          grep -Fqx "## [$runtime_version]" CHANGELOG.md
+
+          source_tree=$(git rev-parse "${SOURCE_SHA}^{tree}")
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            candidate_id="pr-${PR_NUMBER}-${SOURCE_SHA}"
+            artifact_name="release-candidate-${candidate_id}"
+          else
+            candidate_id="manual-${RUN_ID}-${SOURCE_SHA}"
+            artifact_name="release-candidate-${candidate_id}"
+          fi
+
+          {
+            echo "artifact_name=$artifact_name"
+            echo "candidate_id=$candidate_id"
+            echo "release_branch=$RELEASE_BRANCH"
+            echo "source_sha=$SOURCE_SHA"
+            echo "source_tree=$source_tree"
+            echo "tag=$tag"
+            echo "update_public_key=$update_public_key"
+            echo "update_public_key_sha256=$update_public_key_sha256"
+            echo "version=$runtime_version"
+          } >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Windows x64
+    needs: prepare
+    runs-on: windows-latest
+    env:
+      DSH_ATELIER_UPDATE_PUBLIC_KEY: ${{ needs.prepare.outputs.update_public_key }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+    steps:
+      - name: Require update public key
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:DSH_ATELIER_UPDATE_PUBLIC_KEY)) {
+            throw "repository variable DSH_ATELIER_UPDATE_PUBLIC_KEY must not be empty"
+          }
+
+      - name: Check out candidate source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.source_sha }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.92.0
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release --locked -p atelier-bootstrap -p dsh-atelier
+
+      - name: Assemble Windows package
+        shell: pwsh
+        run: |
+          $archive = "dist/dsh-atelier-v$env:RELEASE_VERSION-windows-x64.zip"
+          New-Item -ItemType Directory -Force -Path dist/DSH-Atelier | Out-Null
+          New-Item -ItemType Directory -Force -Path dist/DSH-Atelier/icons | Out-Null
+          Copy-Item target/release/dsh-atelier.exe dist/DSH-Atelier/
+          Copy-Item target/release/dsh-atelier-runtime.exe dist/DSH-Atelier/
+          Copy-Item README.md,LICENSE dist/DSH-Atelier/
+          Copy-Item assets/icons/deepseek-blue.ico,assets/icons/deepseek-black.ico,assets/icons/deepseek-black.svg dist/DSH-Atelier/icons/
+          Compress-Archive -Path dist/DSH-Atelier -DestinationPath $archive
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$archive.sha256", "$hash`n", [Text.UTF8Encoding]::new($false))
+
+      - name: Upload Windows candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ needs.prepare.outputs.candidate_id }}
+          path: |
+            dist/dsh-atelier-v${{ needs.prepare.outputs.version }}-windows-x64.zip
+            dist/dsh-atelier-v${{ needs.prepare.outputs.version }}-windows-x64.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  macos:
+    name: macOS universal packages
+    needs: prepare
+    runs-on: macos-14
+    env:
+      DSH_ATELIER_UPDATE_PUBLIC_KEY: ${{ needs.prepare.outputs.update_public_key }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+    steps:
+      - name: Require update public key
+        shell: bash
+        run: test -n "$DSH_ATELIER_UPDATE_PUBLIC_KEY"
+
+      - name: Check out candidate source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.source_sha }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.92.0
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build both architectures
+        run: |
+          cargo build --release --locked --target x86_64-apple-darwin -p atelier-bootstrap -p dsh-atelier
+          cargo build --release --locked --target aarch64-apple-darwin -p atelier-bootstrap -p dsh-atelier
+
+      - name: Assemble macOS packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          portable_root="dist/DSH Atelier Portable"
+          app="$portable_root/DSH Atelier.app"
+          portable_archive="dist/dsh-atelier-v${RELEASE_VERSION}-macos-universal-portable.zip"
+          dmg_staging="dist/dmg-staging"
+          dmg_archive="dist/dsh-atelier-v${RELEASE_VERSION}-macos-universal.dmg"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$portable_root/data"
+          touch "$portable_root/atelier.portable"
+          lipo -create \
+            target/x86_64-apple-darwin/release/dsh-atelier \
+            target/aarch64-apple-darwin/release/dsh-atelier \
+            -output "$app/Contents/MacOS/DSH Atelier"
+          lipo -create \
+            target/x86_64-apple-darwin/release/dsh-atelier-runtime \
+            target/aarch64-apple-darwin/release/dsh-atelier-runtime \
+            -output "$app/Contents/MacOS/dsh-atelier-runtime"
+          cp packaging/macos/Info.plist "$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $RELEASE_VERSION" "$app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $GITHUB_RUN_NUMBER" "$app/Contents/Info.plist"
+
+          mkdir -p "$app/Contents/Resources/icons"
+          cp "packaging/macos/DSH Atelier.icns" "$app/Contents/Resources/DSH Atelier.icns"
+          cp assets/icons/deepseek-blue.ico assets/icons/deepseek-black.ico assets/icons/deepseek-black.svg "$app/Contents/Resources/icons/"
+
+          plutil -lint "$app/Contents/Info.plist"
+          test "$(plutil -extract CFBundleIconFile raw "$app/Contents/Info.plist")" = "DSH Atelier.icns"
+          test "$(plutil -extract LSUIElement raw "$app/Contents/Info.plist")" = "true"
+          test -f "$app/Contents/Resources/DSH Atelier.icns"
+          lipo "$app/Contents/MacOS/DSH Atelier" -verify_arch x86_64 arm64
+          lipo "$app/Contents/MacOS/dsh-atelier-runtime" -verify_arch x86_64 arm64
+
+          ditto --norsrc --noextattr -c -k --keepParent "$portable_root" "$portable_archive"
+          shasum -a 256 "$portable_archive" | awk '{print $1}' > "$portable_archive.sha256"
+
+          mkdir -p "$dmg_staging"
+          ditto --norsrc --noextattr "$app" "$dmg_staging/DSH Atelier.app"
+          ln -s /Applications "$dmg_staging/Applications"
+          test -x "$dmg_staging/DSH Atelier.app/Contents/MacOS/DSH Atelier"
+          test -x "$dmg_staging/DSH Atelier.app/Contents/MacOS/dsh-atelier-runtime"
+          test "$(readlink "$dmg_staging/Applications")" = "/Applications"
+          hdiutil create \
+            -volname "DSH Atelier" \
+            -srcfolder "$dmg_staging" \
+            -ov \
+            -format UDZO \
+            "$dmg_archive"
+          shasum -a 256 "$dmg_archive" | awk '{print $1}' > "$dmg_archive.sha256"
+
+      - name: Upload macOS candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ needs.prepare.outputs.candidate_id }}
+          path: |
+            dist/dsh-atelier-v${{ needs.prepare.outputs.version }}-macos-universal-portable.zip
+            dist/dsh-atelier-v${{ needs.prepare.outputs.version }}-macos-universal-portable.zip.sha256
+            dist/dsh-atelier-v${{ needs.prepare.outputs.version }}-macos-universal.dmg
+            dist/dsh-atelier-v${{ needs.prepare.outputs.version }}-macos-universal.dmg.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  candidate:
+    name: Assemble release candidate
+    needs:
+      - prepare
+      - windows
+      - macos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Windows candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-${{ needs.prepare.outputs.candidate_id }}
+          path: windows
+
+      - name: Download macOS candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-${{ needs.prepare.outputs.candidate_id }}
+          path: macos
+
+      - name: Build update manifest
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ needs.prepare.outputs.artifact_name }}
+          CANDIDATE_ID: ${{ needs.prepare.outputs.candidate_id }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RELEASE_BRANCH: ${{ needs.prepare.outputs.release_branch }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          SOURCE_TREE: ${{ needs.prepare.outputs.source_tree }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          UPDATE_PUBLIC_KEY_SHA256: ${{ needs.prepare.outputs.update_public_key_sha256 }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir release
+          cp windows/* release/
+          cp macos/* release/
+
+          windows_file="dsh-atelier-v${VERSION}-windows-x64.zip"
+          macos_file="dsh-atelier-v${VERSION}-macos-universal-portable.zip"
+          macos_dmg_file="dsh-atelier-v${VERSION}-macos-universal.dmg"
+          windows_sha=$(sha256sum "release/$windows_file" | awk '{print $1}')
+          macos_sha=$(sha256sum "release/$macos_file" | awk '{print $1}')
+          macos_dmg_sha=$(sha256sum "release/$macos_dmg_file" | awk '{print $1}')
+          test "$windows_sha" = "$(tr -d '[:space:]' < "release/$windows_file.sha256")"
+          test "$macos_sha" = "$(tr -d '[:space:]' < "release/$macos_file.sha256")"
+          test "$macos_dmg_sha" = "$(tr -d '[:space:]' < "release/$macos_dmg_file.sha256")"
+          windows_size=$(stat -c '%s' "release/$windows_file")
+          macos_size=$(stat -c '%s' "release/$macos_file")
+          macos_dmg_size=$(stat -c '%s' "release/$macos_dmg_file")
+
+          jq -n \
+            --arg version "$VERSION" \
+            --arg tag "$TAG" \
+            --arg windows_path "$windows_file" \
+            --arg windows_sha "$windows_sha" \
+            --argjson windows_size "$windows_size" \
+            --arg macos_path "$macos_file" \
+            --arg macos_sha "$macos_sha" \
+            --argjson macos_size "$macos_size" \
+            '{
+              schema: 1,
+              channel: "stable",
+              version: $version,
+              tag: $tag,
+              min_bootstrap_generation: 1,
+              assets: {
+                "windows-x64": {
+                  path: $windows_path,
+                  format: "zip",
+                  size: $windows_size,
+                  sha256: $windows_sha,
+                  runtime_path: "DSH-Atelier/dsh-atelier-runtime.exe"
+                },
+                "macos-universal": {
+                  path: $macos_path,
+                  format: "zip",
+                  size: $macos_size,
+                  sha256: $macos_sha,
+                  runtime_path: "DSH Atelier Portable/DSH Atelier.app/Contents/MacOS/dsh-atelier-runtime"
+                }
+              }
+            }' > release/update-manifest.json
+
+          if [[ "$CANDIDATE_ID" == pr-* ]]; then
+            candidate_pr="$PR_NUMBER"
+          else
+            candidate_pr=null
+          fi
+          jq -n \
+            --arg artifact_name "$ARTIFACT_NAME" \
+            --arg candidate_id "$CANDIDATE_ID" \
+            --arg release_branch "$RELEASE_BRANCH" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_tree "$SOURCE_TREE" \
+            --arg tag "$TAG" \
+            --arg update_public_key_sha256 "$UPDATE_PUBLIC_KEY_SHA256" \
+            --arg version "$VERSION" \
+            --arg windows_sha "$windows_sha" \
+            --arg macos_sha "$macos_sha" \
+            --arg macos_dmg_sha "$macos_dmg_sha" \
+            --argjson macos_dmg_size "$macos_dmg_size" \
+            --argjson pr_number "$candidate_pr" \
+            --argjson workflow_run_id "$GITHUB_RUN_ID" \
+            --argjson workflow_run_attempt "$GITHUB_RUN_ATTEMPT" \
+            '{
+              schema: 1,
+              artifact_name: $artifact_name,
+              candidate_id: $candidate_id,
+              release_branch: $release_branch,
+              pr_number: $pr_number,
+              source_sha: $source_sha,
+              source_tree: $source_tree,
+              version: $version,
+              tag: $tag,
+              update_public_key_sha256: $update_public_key_sha256,
+              workflow_run_id: $workflow_run_id,
+              workflow_run_attempt: $workflow_run_attempt,
+              assets: {
+                "windows-x64": { sha256: $windows_sha },
+                "macos-universal": { sha256: $macos_sha },
+                "macos-dmg": { sha256: $macos_dmg_sha, size: $macos_dmg_size }
+              }
+            }' > release/candidate.json
+
+          jq empty release/update-manifest.json release/candidate.json
+
+      - name: Upload combined release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.prepare.outputs.artifact_name }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Promote candidate to GitHub Release
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'main' &&
+      startsWith(github.event.pull_request.head.ref, 'release/') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-publish
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Check out merged release source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.92.0
+
+      - name: Locate exact successful candidate run
+        id: locate
+        shell: bash
+        env:
+          ARTIFACT_NAME: release-candidate-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          workflow_id=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml" --jq '.id')
+          mapfile -t run_ids < <(
+            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${ARTIFACT_NAME}&per_page=100" \
+              --jq '.artifacts | map(select(.expired == false)) | sort_by(.created_at) | reverse | .[].workflow_run.id'
+          )
+
+          selected=""
+          for run_id in "${run_ids[@]}"; do
+            if gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" | jq -e \
+              --argjson workflow_id "$workflow_id" \
+              --arg head_branch "$HEAD_BRANCH" \
+              --argjson pr_number "$PR_NUMBER" \
+              '.workflow_id == $workflow_id and
+               .event == "pull_request" and
+               .conclusion == "success" and
+               .head_branch == $head_branch and
+               any(.pull_requests[]?; .number == $pr_number)' >/dev/null; then
+              selected="$run_id"
+              break
+            fi
+          done
+
+          if [[ -z "$selected" ]]; then
+            echo "no successful candidate run found for $ARTIFACT_NAME" >&2
+            exit 1
+          fi
+          echo "artifact_name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          echo "run_id=$selected" >> "$GITHUB_OUTPUT"
+
+      - name: Download exact combined candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.locate.outputs.artifact_name }}
+          path: candidate
+          run-id: ${{ steps.locate.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify candidate and source trees
+        id: verify
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ steps.locate.outputs.artifact_name }}
+          CANDIDATE_RUN_ID: ${{ steps.locate.outputs.run_id }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RELEASE_BRANCH: ${{ github.event.pull_request.head.ref }}
+          UPDATE_PUBLIC_KEY: ${{ vars.DSH_ATELIER_UPDATE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          metadata="candidate/candidate.json"
+          manifest="candidate/update-manifest.json"
+          jq empty "$metadata" "$manifest"
+
+          git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head:refs/remotes/origin/release-pr-head"
+          fetched_head=$(git rev-parse refs/remotes/origin/release-pr-head)
+          test "$fetched_head" = "$HEAD_SHA"
+          head_tree=$(git rev-parse "${HEAD_SHA}^{tree}")
+          merge_tree=$(git rev-parse "${MERGE_SHA}^{tree}")
+          test "$merge_tree" = "$head_tree"
+
+          version=$(jq -er '.version' "$metadata")
+          tag=$(jq -er '.tag' "$metadata")
+          test "$tag" = "v$version"
+          if [[ ! "$RELEASE_BRANCH" =~ ^release/(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "release PR head branch must be release/x.y.z: $RELEASE_BRANCH" >&2
+            exit 1
+          fi
+          branch_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+          test "$branch_version" = "$version"
+          update_public_key=$(printf '%s' "$UPDATE_PUBLIC_KEY" | tr -d '[:space:]')
+          update_public_key_raw="$RUNNER_TEMP/update-public-key.raw"
+          printf '%s' "$update_public_key" | base64 --decode > "$update_public_key_raw"
+          test "$(stat -c '%s' "$update_public_key_raw")" = "32"
+          update_public_key_sha256=$(sha256sum "$update_public_key_raw" | awk '{print $1}')
+          jq -e \
+            --arg artifact_name "$ARTIFACT_NAME" \
+            --arg release_branch "$RELEASE_BRANCH" \
+            --arg source_sha "$HEAD_SHA" \
+            --arg source_tree "$head_tree" \
+            --arg version "$version" \
+            --arg tag "$tag" \
+            --arg update_public_key_sha256 "$update_public_key_sha256" \
+            --argjson pr_number "$PR_NUMBER" \
+            --argjson run_id "$CANDIDATE_RUN_ID" \
+            '.schema == 1 and
+             .artifact_name == $artifact_name and
+             .release_branch == $release_branch and
+             .pr_number == $pr_number and
+             .source_sha == $source_sha and
+             .source_tree == $source_tree and
+             .version == $version and
+             .tag == $tag and
+             .update_public_key_sha256 == $update_public_key_sha256 and
+             .workflow_run_id == $run_id' "$metadata" >/dev/null
+
+          cargo metadata --locked --no-deps --format-version 1 > merged-metadata.json
+          runtime_version=$(jq -er '.packages[] | select(.name == "dsh-atelier") | .version' merged-metadata.json)
+          bootstrap_version=$(jq -er '.packages[] | select(.name == "atelier-bootstrap") | .version' merged-metadata.json)
+          test "$version" = "$runtime_version"
+          test "$version" = "$bootstrap_version"
+          grep -Fqx "## [$version]" CHANGELOG.md
+
+          windows_file="dsh-atelier-v${version}-windows-x64.zip"
+          macos_file="dsh-atelier-v${version}-macos-universal-portable.zip"
+          macos_dmg_file="dsh-atelier-v${version}-macos-universal.dmg"
+          windows_sha=$(sha256sum "candidate/$windows_file" | awk '{print $1}')
+          macos_sha=$(sha256sum "candidate/$macos_file" | awk '{print $1}')
+          macos_dmg_sha=$(sha256sum "candidate/$macos_dmg_file" | awk '{print $1}')
+          test "$windows_sha" = "$(tr -d '[:space:]' < "candidate/$windows_file.sha256")"
+          test "$macos_sha" = "$(tr -d '[:space:]' < "candidate/$macos_file.sha256")"
+          test "$macos_dmg_sha" = "$(tr -d '[:space:]' < "candidate/$macos_dmg_file.sha256")"
+          test "$windows_sha" = "$(jq -er '.assets["windows-x64"].sha256' "$manifest")"
+          test "$macos_sha" = "$(jq -er '.assets["macos-universal"].sha256' "$manifest")"
+          test "$windows_sha" = "$(jq -er '.assets["windows-x64"].sha256' "$metadata")"
+          test "$macos_sha" = "$(jq -er '.assets["macos-universal"].sha256' "$metadata")"
+          test "$macos_dmg_sha" = "$(jq -er '.assets["macos-dmg"].sha256' "$metadata")"
+          test "$(stat -c '%s' "candidate/$windows_file")" = "$(jq -er '.assets["windows-x64"].size' "$manifest")"
+          test "$(stat -c '%s' "candidate/$macos_file")" = "$(jq -er '.assets["macos-universal"].size' "$manifest")"
+          test "$(stat -c '%s' "candidate/$macos_dmg_file")" = "$(jq -er '.assets["macos-dmg"].size' "$metadata")"
+
+          jq -e \
+            --arg version "$version" \
+            --arg tag "$tag" \
+            --arg windows_file "$windows_file" \
+            --arg macos_file "$macos_file" \
+            '.schema == 1 and
+             .channel == "stable" and
+             .version == $version and
+             .tag == $tag and
+             .min_bootstrap_generation == 1 and
+             .assets["windows-x64"].path == $windows_file and
+             .assets["windows-x64"].format == "zip" and
+             .assets["windows-x64"].runtime_path == "DSH-Atelier/dsh-atelier-runtime.exe" and
+             .assets["macos-universal"].path == $macos_file and
+             .assets["macos-universal"].format == "zip" and
+             .assets["macos-universal"].runtime_path == "DSH Atelier Portable/DSH Atelier.app/Contents/MacOS/dsh-atelier-runtime"' \
+            "$manifest" >/dev/null
+
+          unzip -Z1 "candidate/$windows_file" | grep -Fqx 'DSH-Atelier/dsh-atelier-runtime.exe'
+          unzip -Z1 "candidate/$macos_file" | grep -Fqx 'DSH Atelier Portable/DSH Atelier.app/Contents/MacOS/dsh-atelier-runtime'
+
+          {
+            echo "macos_file=$macos_file"
+            echo "macos_dmg_file=$macos_dmg_file"
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "windows_file=$windows_file"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Sign update manifest
+        shell: bash
+        env:
+          EXPECTED_UPDATE_PUBLIC_KEY: ${{ vars.DSH_ATELIER_UPDATE_PUBLIC_KEY }}
+          SIGNING_KEY_PEM_B64: ${{ secrets.UPDATE_MANIFEST_SIGNING_KEY_PEM_B64 }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$EXPECTED_UPDATE_PUBLIC_KEY" ]]; then
+            echo "repository variable DSH_ATELIER_UPDATE_PUBLIC_KEY must not be empty" >&2
+            exit 1
+          fi
+          if [[ -z "$SIGNING_KEY_PEM_B64" ]]; then
+            echo "secret UPDATE_MANIFEST_SIGNING_KEY_PEM_B64 must not be empty" >&2
+            exit 1
+          fi
+
+          key_file="$RUNNER_TEMP/update-manifest-signing-key.pem"
+          public_file="$RUNNER_TEMP/update-manifest-signing-key.pub.pem"
+          public_der_file="$RUNNER_TEMP/update-manifest-signing-key.pub.der"
+          signature_file="$RUNNER_TEMP/update-manifest.sig.raw"
+          trap 'rm -f "$key_file" "$public_file" "$public_der_file" "$signature_file"' EXIT
+          umask 077
+          printf '%s' "$SIGNING_KEY_PEM_B64" | base64 --decode > "$key_file"
+          openssl pkey -in "$key_file" -pubout -out "$public_file"
+          openssl pkey -in "$key_file" -pubout -outform DER -out "$public_der_file"
+
+          # RFC 8410 Ed25519 SubjectPublicKeyInfo is exactly:
+          # 302a300506032b6570032100 || 32-byte raw public key.
+          test "$(stat -c '%s' "$public_der_file")" = "44"
+          public_der_prefix=$(od -An -tx1 -N12 "$public_der_file" | tr -d '[:space:]')
+          test "$public_der_prefix" = "302a300506032b6570032100"
+          derived_public_key=$(tail -c 32 "$public_der_file" | base64 --wrap=0)
+          expected_public_key=$(printf '%s' "$EXPECTED_UPDATE_PUBLIC_KEY" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+          if [[ "$derived_public_key" != "$expected_public_key" ]]; then
+            echo "signing secret does not match DSH_ATELIER_UPDATE_PUBLIC_KEY" >&2
+            exit 1
+          fi
+
+          openssl pkeyutl -sign -rawin \
+            -inkey "$key_file" \
+            -in candidate/update-manifest.json \
+            -out "$signature_file"
+          test "$(stat -c '%s' "$signature_file")" = "64"
+          openssl pkeyutl -verify -rawin -pubin \
+            -inkey "$public_file" \
+            -in candidate/update-manifest.json \
+            -sigfile "$signature_file"
+          base64 --wrap=0 "$signature_file" > candidate/update-manifest.json.sig
+          printf '\n' >> candidate/update-manifest.json.sig
+
+      - name: Create tag and publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MACOS_FILE: ${{ steps.verify.outputs.macos_file }}
+          MACOS_DMG_FILE: ${{ steps.verify.outputs.macos_dmg_file }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          TAG: ${{ steps.verify.outputs.tag }}
+          VERSION: ${{ steps.verify.outputs.version }}
+          WINDOWS_FILE: ${{ steps.verify.outputs.windows_file }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --tags origin
+
+          if git rev-parse --quiet --verify "refs/tags/$TAG" >/dev/null; then
+            test "$(git rev-list -n 1 "$TAG")" = "$MERGE_SHA"
+          else
+            git tag -a "$TAG" "$MERGE_SHA" -m "DSH Atelier $TAG"
+            git push origin "refs/tags/$TAG"
+          fi
+
+          awk -v header="## [$VERSION]" '
+            $0 == header { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+
+          if gh release view "$TAG" --json isDraft >/tmp/release.json 2>/dev/null; then
+            jq -e '.isDraft == true' /tmp/release.json >/dev/null
+          else
+            gh release create "$TAG" \
+              --verify-tag \
+              --draft \
+              --title "DSH Atelier $TAG" \
+              --notes-file release-notes.md
+          fi
+
+          gh release upload "$TAG" --clobber \
+            "candidate/$WINDOWS_FILE" \
+            "candidate/$WINDOWS_FILE.sha256" \
+            "candidate/$MACOS_FILE" \
+            "candidate/$MACOS_FILE.sha256" \
+            "candidate/$MACOS_DMG_FILE" \
+            "candidate/$MACOS_DMG_FILE.sha256" \
+            candidate/update-manifest.json \
+            candidate/update-manifest.json.sig
+
+          expected_assets=(
+            "$WINDOWS_FILE"
+            "$WINDOWS_FILE.sha256"
+            "$MACOS_FILE"
+            "$MACOS_FILE.sha256"
+            "$MACOS_DMG_FILE"
+            "$MACOS_DMG_FILE.sha256"
+            "update-manifest.json"
+            "update-manifest.json.sig"
+          )
+          mapfile -t expected_assets_sorted < <(printf '%s\n' "${expected_assets[@]}" | sort)
+          mapfile -t actual_assets < <(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)
+          test "${#actual_assets[@]}" = "${#expected_assets_sorted[@]}"
+          for index in "${!expected_assets_sorted[@]}"; do
+            test "${actual_assets[$index]}" = "${expected_assets_sorted[$index]}"
+          done
+          gh release edit "$TAG" --draft=false

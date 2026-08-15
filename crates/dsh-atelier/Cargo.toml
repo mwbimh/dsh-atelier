@@ -8,8 +8,10 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+atelier-bootstrap = { path = "../atelier-bootstrap" }
 base64.workspace = true
 directories.workspace = true
+ed25519-dalek.workspace = true
 fs2.workspace = true
 image.workspace = true
 flate2.workspace = true

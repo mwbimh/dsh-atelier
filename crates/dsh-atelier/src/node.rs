@@ -780,6 +780,16 @@ mod tests {
         extract_node_archive(&archive_path, &distribution, &extracted).unwrap();
         validate_extracted_node(&distribution, &extracted).unwrap();
         assert_eq!(fs::read(extracted.join("bin/node")).unwrap(), b"node");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = fs::metadata(extracted.join("bin/node"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_ne!(mode & 0o111, 0, "extracted Node must remain executable");
+        }
     }
 
     #[test]

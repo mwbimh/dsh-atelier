@@ -1,4 +1,5 @@
 pub mod app;
+pub mod atelier_update;
 pub mod config;
 pub mod controller;
 pub mod dsh;

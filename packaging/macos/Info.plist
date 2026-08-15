@@ -10,6 +10,8 @@
   <string>com.deepseek-harness.atelier</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
+  <key>CFBundleIconFile</key>
+  <string>DSH Atelier.icns</string>
   <key>CFBundleName</key>
   <string>DSH Atelier</string>
   <key>CFBundlePackageType</key>
@@ -22,5 +24,12 @@
   <string>12.0</string>
   <key>LSUIElement</key>
   <true/>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsLocalNetworking</key>
+    <true/>
+  </dict>
 </dict>
 </plist>

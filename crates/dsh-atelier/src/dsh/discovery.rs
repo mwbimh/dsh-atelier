@@ -1,9 +1,35 @@
 use std::{
     collections::HashSet,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     time::Duration,
 };
+
+/// Returns the executable search path appropriate for a desktop launch.
+///
+/// Finder and LaunchAgent processes commonly receive a minimal PATH on macOS,
+/// so the two system-wide Homebrew locations are checked explicitly without
+/// evaluating a user's shell startup files or changing this process's PATH.
+#[must_use]
+pub fn desktop_search_path(inherited: Option<&OsStr>) -> OsString {
+    let directories = inherited
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .collect::<Vec<_>>();
+    #[cfg(target_os = "macos")]
+    let directories = {
+        let mut directories = directories;
+        for directory in ["/opt/homebrew/bin", "/usr/local/bin"] {
+            let directory = PathBuf::from(directory);
+            if !directories.contains(&directory) {
+                directories.push(directory);
+            }
+        }
+        directories
+    };
+    std::env::join_paths(directories)
+        .unwrap_or_else(|_| inherited.map(OsStr::to_os_string).unwrap_or_default())
+}
 
 use async_trait::async_trait;
 use semver::Version;
@@ -325,6 +351,25 @@ mod tests {
         assert_eq!(
             parse_dsh_version("1.2.3+build.4").unwrap(),
             Version::parse("1.2.3+build.4").unwrap()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn desktop_search_path_adds_both_homebrew_locations_without_duplicates() {
+        let inherited =
+            std::env::join_paths([Path::new("/usr/bin"), Path::new("/opt/homebrew/bin")]).unwrap();
+
+        let path = desktop_search_path(Some(&inherited));
+        let directories = std::env::split_paths(&path).collect::<Vec<_>>();
+
+        assert_eq!(
+            directories,
+            [
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/opt/homebrew/bin"),
+                PathBuf::from("/usr/local/bin"),
+            ]
         );
     }
 

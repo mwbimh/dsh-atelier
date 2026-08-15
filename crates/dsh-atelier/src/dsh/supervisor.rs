@@ -20,12 +20,19 @@ use crate::{
     process::CommandSpec,
 };
 
+#[cfg(target_os = "macos")]
+use std::os::unix::process::CommandExt as _;
+
 #[cfg(windows)]
 use crate::process::WINDOWS_CREATE_NO_WINDOW;
 
 const OUTPUT_LINE_LIMIT: usize = 512;
 #[cfg(windows)]
 const WINDOWS_JOB_STOP_CODE: u32 = 0xA7E1;
+#[cfg(target_os = "macos")]
+const SIGTERM: i32 = 15;
+#[cfg(target_os = "macos")]
+const SIGKILL: i32 = 9;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DshState {
@@ -91,6 +98,8 @@ pub struct DshSupervisor {
     child: Option<Child>,
     #[cfg(windows)]
     windows_job: Option<crate::windows_job::WindowsJob>,
+    #[cfg(target_os = "macos")]
+    process_group: Option<u32>,
     stdout_lines: Arc<Mutex<VecDeque<String>>>,
     stderr_lines: Arc<Mutex<VecDeque<String>>>,
     readiness_rx: Option<mpsc::UnboundedReceiver<String>>,
@@ -107,6 +116,8 @@ impl DshSupervisor {
             child: None,
             #[cfg(windows)]
             windows_job: None,
+            #[cfg(target_os = "macos")]
+            process_group: None,
             stdout_lines: Arc::new(Mutex::new(VecDeque::new())),
             stderr_lines: Arc::new(Mutex::new(VecDeque::new())),
             readiness_rx: None,
@@ -190,6 +201,10 @@ impl DshSupervisor {
         };
 
         self.child = None;
+        #[cfg(target_os = "macos")]
+        if let Some(process_group) = self.process_group.take() {
+            let _ = signal_process_group(process_group, SIGKILL);
+        }
         self.clear_output_tasks();
         self.state = if matches!(self.state, DshState::Ready { .. }) {
             DshState::Crashed {
@@ -203,18 +218,23 @@ impl DshSupervisor {
         Ok(self.state.clone())
     }
 
-    /// Stops the current DSH child. This is force-only on Windows until the
-    /// process adapter supplies the planned in-process stop hook and Job Object.
+    /// Stops the current DSH process tree and reaps its direct child.
     pub async fn stop(&mut self) -> Result<(), SupervisorError> {
         let mut child = self.child.take();
         #[cfg(windows)]
         let job = self.windows_job.take();
+        #[cfg(target_os = "macos")]
+        let process_group = self.process_group.take();
 
         if child.is_none() {
             #[cfg(windows)]
             if let Some(job) = job {
                 job.terminate(WINDOWS_JOB_STOP_CODE)
                     .map_err(SupervisorError::Stop)?;
+            }
+            #[cfg(target_os = "macos")]
+            if let Some(process_group) = process_group {
+                finish_process_group_cleanup(process_group).map_err(SupervisorError::Stop)?;
             }
             self.state = DshState::Stopped;
             self.clear_output_tasks();
@@ -229,11 +249,20 @@ impl DshSupervisor {
             Ok(())
         };
 
+        #[cfg(target_os = "macos")]
+        let group_termination = process_group
+            .map(|process_group| signal_process_group(process_group, SIGTERM))
+            .unwrap_or(Ok(()));
+
         if child.try_wait().map_err(SupervisorError::Stop)?.is_none() {
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "macos")))]
             child.start_kill().map_err(SupervisorError::Stop)?;
             #[cfg(windows)]
             if job.is_none() || job_termination.is_err() {
+                child.start_kill().map_err(SupervisorError::Stop)?;
+            }
+            #[cfg(target_os = "macos")]
+            if process_group.is_none() || group_termination.is_err() {
                 child.start_kill().map_err(SupervisorError::Stop)?;
             }
             match time::timeout(self.options.stop_timeout, child.wait()).await {
@@ -241,6 +270,14 @@ impl DshSupervisor {
                     result.map_err(SupervisorError::Stop)?;
                 }
                 Err(_) => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        if let Some(process_group) = process_group {
+                            let _ = signal_process_group(process_group, SIGKILL);
+                        }
+                        let _ = child.start_kill();
+                        let _ = time::timeout(self.options.stop_timeout, child.wait()).await;
+                    }
                     self.clear_output_tasks();
                     self.state = DshState::Failed {
                         message: SupervisorError::StopTimeout(self.options.stop_timeout)
@@ -248,6 +285,20 @@ impl DshSupervisor {
                     };
                     return Err(SupervisorError::StopTimeout(self.options.stop_timeout));
                 }
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(process_group) = process_group {
+                finish_process_group_cleanup(process_group).map_err(SupervisorError::Stop)?;
+            }
+            if let Err(error) = group_termination {
+                self.clear_output_tasks();
+                self.state = DshState::Failed {
+                    message: format!("failed to stop DSH: {error}"),
+                };
+                return Err(SupervisorError::Stop(error));
             }
         }
 
@@ -276,6 +327,8 @@ impl DshSupervisor {
             .kill_on_drop(true);
         #[cfg(windows)]
         command.creation_flags(WINDOWS_CREATE_NO_WINDOW);
+        #[cfg(target_os = "macos")]
+        command.as_std_mut().process_group(0);
         if let Some(current_dir) = &self.spec.current_dir {
             command.current_dir(current_dir);
         }
@@ -284,6 +337,8 @@ impl DshSupervisor {
         let job =
             crate::windows_job::WindowsJob::create().map_err(SupervisorError::WindowsJobSetup)?;
         let mut child = command.spawn().map_err(SupervisorError::Spawn)?;
+        #[cfg(target_os = "macos")]
+        let process_group = child.id();
         #[cfg(windows)]
         if let Err(error) = job.assign(&child) {
             let _ = child.start_kill();
@@ -314,6 +369,10 @@ impl DshSupervisor {
         #[cfg(windows)]
         {
             self.windows_job = Some(job);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.process_group = process_group;
         }
         self.readiness_rx = Some(readiness_rx);
         Ok(())
@@ -395,6 +454,10 @@ impl DshSupervisor {
     }
 
     async fn force_stop_after_failed_start(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(process_group) = self.process_group.take() {
+            let _ = signal_process_group(process_group, SIGKILL);
+        }
         if let Some(mut child) = self.child.take() {
             #[cfg(windows)]
             let terminated_job = self
@@ -412,7 +475,7 @@ impl DshSupervisor {
         {
             self.windows_job = None;
         }
-        self.clear_output_tasks();
+        self.finish_output_tasks().await;
     }
 
     fn fail(&mut self, error: SupervisorError) -> SupervisorError {
@@ -426,6 +489,18 @@ impl DshSupervisor {
         self.readiness_rx = None;
         for task in self.output_tasks.drain(..) {
             task.abort();
+        }
+    }
+
+    async fn finish_output_tasks(&mut self) {
+        self.readiness_rx = None;
+        for mut task in self.output_tasks.drain(..) {
+            if time::timeout(self.options.stop_timeout, &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
         }
     }
 }
@@ -447,12 +522,16 @@ impl Drop for DshSupervisor {
             .is_some_and(|job| job.terminate(WINDOWS_JOB_STOP_CODE).is_ok());
         #[cfg(not(windows))]
         let terminated_job = false;
+        #[cfg(target_os = "macos")]
+        if let Some(process_group) = self.process_group.take() {
+            let _ = signal_process_group(process_group, SIGKILL);
+        }
         if let Some(child) = self.child.as_mut()
             && !terminated_job
         {
             let _ = child.start_kill();
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         if let Some(child) = self.child.as_mut() {
             let deadline = Instant::now() + self.options.stop_timeout;
             while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
@@ -464,6 +543,43 @@ impl Drop for DshSupervisor {
             self.windows_job = None;
         }
         self.clear_output_tasks();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn signal_process_group(process_group: u32, signal: i32) -> std::io::Result<()> {
+    unsafe extern "C" {
+        fn kill(process: i32, signal: i32) -> i32;
+    }
+
+    let process_group = i32::try_from(process_group)
+        .map_err(|_| std::io::Error::other("DSH process group id exceeds i32"))?;
+    // SAFETY: `kill` is called with a negative, validated child process-group
+    // id and a standard signal number. No borrowed memory crosses the FFI.
+    if unsafe { kill(-process_group, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(3) {
+        // ESRCH means every member of the group has already exited.
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn finish_process_group_cleanup(process_group: u32) -> std::io::Result<()> {
+    match signal_process_group(process_group, SIGKILL) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            // The direct child has already been reaped at both call sites. If
+            // its process group disappeared and the numeric id was reused by a
+            // process we do not own, macOS reports EPERM instead of ESRCH. Do
+            // not turn that harmless reuse race into a failed Stop operation.
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -717,9 +833,9 @@ mod tests {
         assert!(matches!(supervisor.state(), DshState::Failed { .. }));
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
-    async fn stop_terminates_the_complete_windows_process_tree() {
+    async fn stop_terminates_the_complete_process_tree() {
         let directory = tempfile::tempdir().unwrap();
         let marker = directory.path().join("grandchild-survived.txt");
         let mut spec = helper_spec("tree-parent");
@@ -731,12 +847,12 @@ mod tests {
         supervisor.stop().await.unwrap();
         time::sleep(Duration::from_secs(1)).await;
 
-        assert!(!marker.exists(), "a DSH descendant escaped the Job Object");
+        assert!(!marker.exists(), "a DSH descendant escaped process cleanup");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
-    async fn drop_terminates_and_reaps_the_windows_process_tree() {
+    async fn drop_terminates_and_reaps_the_complete_process_tree() {
         let directory = tempfile::tempdir().unwrap();
         let marker = directory.path().join("grandchild-survived-drop.txt");
         let mut spec = helper_spec("tree-parent");
@@ -751,7 +867,7 @@ mod tests {
         assert!(!marker.exists(), "a DSH descendant escaped Drop cleanup");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn path_as_environment_value(path: &std::path::Path) -> String {
         path.to_str().unwrap().to_owned()
     }

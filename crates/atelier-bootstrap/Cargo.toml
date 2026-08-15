@@ -7,12 +7,17 @@ rust-version.workspace = true
 
 [dependencies]
 directories.workspace = true
+fs2.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]
 winresource.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile.workspace = true
