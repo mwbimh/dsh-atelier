@@ -1088,6 +1088,8 @@ fn stage_verified_runtime<R: Read + io::Seek>(
             path: executable.clone(),
             source,
         })?;
+        drop(output);
+        drop(entry);
         if destination.exists() {
             reuse_identical_destination(
                 &staging,
